@@ -1,0 +1,11 @@
+database:
+  url: "postgres://admin:admin123@192.168.1.51:5432/mydb"
+  max_conns: 10
+  min_conns: 2
+  max_conn_lifetime: "1h"
+  max_conn_idle_time: "30m"
+  health_check_period: "1m"
+
+query:
+  sql: "SELECT 11"
+  timeout: "5s"
