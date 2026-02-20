@@ -1,4 +1,5 @@
-database:
+databases:
+  main:
     url: "postgres://admin:admin123@192.168.1.51:5432/mydb"
     max_conns: 10
     min_conns: 2
@@ -6,6 +7,23 @@ database:
     max_conn_idle_time: "30m"
     health_check_period: "1m"
 
-query:
-  sql: "SELECT 12"
-  timeout: "5s"
+  somedb:
+    url: "postgres://admin:admin123@192.168.1.51:5432/somedb"
+    max_conns: 10
+    min_conns: 2
+    max_conn_lifetime: "1h"
+    max_conn_idle_time: "30m"
+    health_check_period: "1m"
+
+queries:
+  query1:
+    db: "main"
+    sql: "SELECT 12"
+    timeout: "5s"
+    interval: "30s"
+
+  query2:
+    db: "somedb"
+    sql: "SELECT 111"
+    timeout: "5s"
+    interval: "1m"
