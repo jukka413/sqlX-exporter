@@ -96,6 +96,35 @@ func init() {
 	prometheus.MustRegister(dbPoolTotal)
 }
 
+// ================= Custom metrics ==========
+
+var (
+	queryResultMetrics = make(map[string]*prometheus.GaugeVec)
+	metricsMu          sync.Mutex
+)
+
+func getOrCreateQueryMetric(queryName string) *prometheus.GaugeVec {
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
+
+	if m, ok := queryResultMetrics[queryName]; ok {
+		return m
+	}
+
+	metric := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: queryName,
+			Help: "SQL query result metric for " + queryName,
+		},
+		[]string{"db"},
+	)
+
+	prometheus.MustRegister(metric)
+	queryResultMetrics[queryName] = metric
+
+	return metric
+}
+
 //
 // ================= STRUCTS =================
 //
@@ -365,7 +394,23 @@ func startQueryWorker(
 				continue
 			}
 
-			logger.Info("query success", "query", name, "result", result, "duration", time.Since(start).String())
+			// преобразуем результат в float64
+			value, ok := toFloat64(result)
+			if !ok {
+				logger.Error("query result is not numeric", "query", name)
+				continue
+			}
+
+			// получаем метрику
+			metric := getOrCreateQueryMetric(name)
+			metric.WithLabelValues(queryCfg.DB).Set(value)
+
+			logger.Info("query success",
+				"query", name,
+				"value", value,
+				"duration", duration,
+			)
+
 		}
 	}
 }
@@ -394,5 +439,22 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 		case err := <-watcher.Errors:
 			logger.Error("watcher error", "error", err)
 		}
+	}
+}
+
+func toFloat64(v any) (float64, bool) {
+	switch t := v.(type) {
+	case int:
+		return float64(t), true
+	case int32:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	case float32:
+		return float64(t), true
+	case float64:
+		return t, true
+	default:
+		return 0, false
 	}
 }

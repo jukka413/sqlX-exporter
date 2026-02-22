@@ -22,6 +22,12 @@ queries:
     timeout: "5s"
     interval: "30s"
 
+  query4:
+    db: "main"
+    sql: "SELECT 16"
+    timeout: "5s"
+    interval: "30s"
+
   query3:
     db: "main"
     sql: "SELECT 14 from dual"
