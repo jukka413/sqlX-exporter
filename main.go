@@ -3,13 +3,17 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,90 +32,293 @@ type Config struct {
 	} `yaml:"queries"`
 }
 
-func main() {
+//
+// ================= METRICS =================
+//
 
+var (
+	queryErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "app_query_errors_total",
+			Help: "Total number of query execution errors",
+		},
+		[]string{"query", "db"},
+	)
+
+	dbConnectionErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "app_db_connection_errors_total",
+			Help: "Total number of database connection errors",
+		},
+		[]string{"db"},
+	)
+
+	queryDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "app_query_duration_seconds",
+			Help:    "Query execution duration",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"query", "db"},
+	)
+
+	dbPoolAcquired = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "app_db_pool_acquired_connections",
+			Help: "Currently acquired connections",
+		},
+		[]string{"db"},
+	)
+
+	dbPoolIdle = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "app_db_pool_idle_connections",
+			Help: "Idle connections",
+		},
+		[]string{"db"},
+	)
+
+	dbPoolTotal = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "app_db_pool_total_connections",
+			Help: "Total connections in pool",
+		},
+		[]string{"db"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(queryErrors)
+	prometheus.MustRegister(dbConnectionErrors)
+	prometheus.MustRegister(queryDuration)
+	prometheus.MustRegister(dbPoolAcquired)
+	prometheus.MustRegister(dbPoolIdle)
+	prometheus.MustRegister(dbPoolTotal)
+}
+
+//
+// ================= STRUCTS =================
+//
+
+type Worker struct {
+	cancel context.CancelFunc
+	wg     *sync.WaitGroup
+	cfg    struct {
+		SQL      string
+		Timeout  string
+		Interval string
+		DB       string
+	}
+}
+
+type DBPool struct {
+	cfg struct {
+		URL      string
+		MaxConns int
+		MinConns int
+	}
+	pool *pgxpool.Pool
+}
+
+//
+// ================= MAIN =================
+//
+
+func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	// ---------- Graceful shutdown ----------
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	appCtx, appCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer appCancel()
 
-	// ---------- Load config ----------
-	var cfg Config
-	data, err := os.ReadFile("config.yaml")
-	if err != nil {
-		logger.Error("failed to read config.yaml", "error", err)
-		os.Exit(1)
-	}
+	// ---- Metrics server ----
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		if err := http.ListenAndServe(":2112", nil); err != nil {
+			logger.Error("metrics server failed", "error", err)
+		}
+	}()
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		logger.Error("failed to parse YAML", "error", err)
-		os.Exit(1)
-	}
+	configPath := "./config.yaml"
 
-	// ---------- Create pools ----------
-	pools := make(map[string]*pgxpool.Pool)
+	var (
+		workers = make(map[string]*Worker)
+		pools   = make(map[string]*DBPool)
+		mu      sync.Mutex
+	)
 
-	for name, dbCfg := range cfg.Databases {
+	// ---- Pool metrics updater ----
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
 
-		poolCfg, err := pgxpool.ParseConfig(dbCfg.URL)
+		for {
+			select {
+			case <-appCtx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				for name, p := range pools {
+					stat := p.pool.Stat()
+					dbPoolAcquired.WithLabelValues(name).Set(float64(stat.AcquiredConns()))
+					dbPoolIdle.WithLabelValues(name).Set(float64(stat.IdleConns()))
+					dbPoolTotal.WithLabelValues(name).Set(float64(stat.TotalConns()))
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	reload := func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		logger.Info("reloading configuration")
+		newCfg, err := loadConfig(configPath)
 		if err != nil {
-			logger.Error("failed to parse db config", "db", name, "error", err)
-			//os.Exit(1)
-			continue
+			logger.Error("failed to load config", "error", err)
+			return
 		}
 
-		poolCfg.MaxConns = int32(dbCfg.MaxConns)
-		poolCfg.MinConns = int32(dbCfg.MinConns)
+		// ---------------- DB Pools ----------------
+		for name, dbCfg := range newCfg.Databases {
+			old, exists := pools[name]
+			needUpdate := !exists || old.cfg.URL != dbCfg.URL || old.cfg.MaxConns != dbCfg.MaxConns || old.cfg.MinConns != dbCfg.MinConns
+			if needUpdate {
+				if exists && old.pool != nil {
+					logger.Info("closing old pool", "db", name)
+					old.pool.Close()
+				}
 
-		pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
-		if err != nil {
-			logger.Error("failed to create pool", "db", name, "error", err)
-			continue
+				poolCfg, err := pgxpool.ParseConfig(dbCfg.URL)
+				if err != nil {
+					logger.Error("bad db config", "db", name, "error", err)
+					dbConnectionErrors.WithLabelValues(name).Inc()
+					continue
+				}
+				poolCfg.MaxConns = int32(dbCfg.MaxConns)
+				poolCfg.MinConns = int32(dbCfg.MinConns)
+
+				pool, err := pgxpool.NewWithConfig(appCtx, poolCfg)
+				if err != nil {
+					logger.Error("failed to create pool", "db", name, "error", err)
+					dbConnectionErrors.WithLabelValues(name).Inc()
+					continue
+				}
+
+				pingCtx, cancel := context.WithTimeout(appCtx, 5*time.Second)
+				if err := pool.Ping(pingCtx); err != nil {
+					cancel()
+					logger.Error("ping failed", "db", name, "error", err)
+					dbConnectionErrors.WithLabelValues(name).Inc()
+					pool.Close()
+					continue
+				}
+				cancel()
+
+				logger.Info("connected to database", "db", name)
+				pools[name] = &DBPool{
+					cfg: struct {
+						URL                string
+						MaxConns, MinConns int
+					}{dbCfg.URL, dbCfg.MaxConns, dbCfg.MinConns},
+					pool: pool,
+				}
+			}
 		}
 
-		// Проверка подключения
-		pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err = pool.Ping(pingCtx)
-		cancel()
+		// ---------------- Workers ----------------
+		for name, q := range newCfg.Queries {
+			w, exists := workers[name]
+			poolEntry, poolExists := pools[q.DB]
+			if !poolExists {
+				logger.Error("db not available for query", "query", name, "db", q.DB)
+				continue
+			}
 
-		if err != nil {
-			logger.Error("database ping failed", "db", name, "error", err)
-			pool.Close()
-			continue
+			changed := !exists ||
+				w.cfg.SQL != q.SQL ||
+				w.cfg.Timeout != q.Timeout ||
+				w.cfg.Interval != q.Interval ||
+				w.cfg.DB != q.DB
+
+			if changed {
+				// если воркер существует, останавливаем его
+				if exists {
+					logger.Info("stopping changed query worker", "query", name)
+					w.cancel()
+					w.wg.Wait()
+				}
+
+				// создаём новый воркер
+				wg := &sync.WaitGroup{}
+				wg.Add(1)
+				ctx, cancel := context.WithCancel(appCtx)
+				go startQueryWorker(ctx, wg, logger, name, q, poolEntry.pool)
+
+				workers[name] = &Worker{
+					cancel: cancel,
+					wg:     wg,
+					cfg: struct {
+						SQL      string
+						Timeout  string
+						Interval string
+						DB       string
+					}{q.SQL, q.Timeout, q.Interval, q.DB},
+				}
+
+				logger.Info("started new/updated query worker", "query", name)
+			}
 		}
 
-		pools[name] = pool
-		logger.Info("connected to database", "db", name)
+		// Останавливаем удалённые воркеры
+		for name, w := range workers {
+			if _, ok := newCfg.Queries[name]; !ok {
+				logger.Info("stopping removed query", "query", name)
+				w.cancel()
+				w.wg.Wait()
+				delete(workers, name)
+			}
+		}
+
+		logger.Info("smart reload complete")
 	}
 
-	if len(pools) == 0 {
-		logger.Error("no databases available, shutting down")
-		os.Exit(1)
+	// Первый старт
+	reload()
+
+	// FSNotify watcher
+	go watchConfig(appCtx, logger, configPath, reload)
+
+	<-appCtx.Done()
+
+	logger.Info("shutting down workers")
+
+	mu.Lock()
+	for _, w := range workers {
+		w.cancel()
+		w.wg.Wait()
 	}
+	mu.Unlock()
 
-	// ---------- Start query workers ----------
-	var wg sync.WaitGroup
-
-	for name, queryCfg := range cfg.Queries {
-		wg.Add(1)
-		go startQueryWorker(ctx, &wg, logger, name, queryCfg, pools)
-	}
-
-	// ---------- Wait shutdown signal ----------
-	<-ctx.Done()
-	logger.Info("shutdown signal received")
-
-	// Ждём завершения всех воркеров
-	wg.Wait()
-
-	// Закрываем все пулы
-	for name, pool := range pools {
+	for name, p := range pools {
 		logger.Info("closing pool", "db", name)
-		pool.Close()
+		p.pool.Close()
 	}
 
 	logger.Info("application stopped gracefully")
+
+}
+
+// ---------------- Helpers ----------------
+
+func loadConfig(path string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+	err = yaml.Unmarshal(data, &cfg)
+	return cfg, err
 }
 
 func startQueryWorker(
@@ -125,27 +332,12 @@ func startQueryWorker(
 		Timeout  string `yaml:"timeout"`
 		Interval string `yaml:"interval"`
 	},
-	pools map[string]*pgxpool.Pool,
+	pool *pgxpool.Pool,
 ) {
 	defer wg.Done()
 
-	pool, ok := pools[queryCfg.DB]
-	if !ok {
-		logger.Error("database not found for query", "query", name, "db", queryCfg.DB)
-		return
-	}
-
-	interval, err := time.ParseDuration(queryCfg.Interval)
-	if err != nil {
-		logger.Error("invalid interval", "query", name, "error", err)
-		return
-	}
-
-	timeout, err := time.ParseDuration(queryCfg.Timeout)
-	if err != nil {
-		logger.Error("invalid timeout", "query", name, "error", err)
-		return
-	}
+	interval, _ := time.ParseDuration(queryCfg.Interval)
+	timeout, _ := time.ParseDuration(queryCfg.Timeout)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -154,48 +346,53 @@ func startQueryWorker(
 
 	for {
 		select {
-
 		case <-ctx.Done():
 			logger.Info("stopping query worker", "query", name)
 			return
-
 		case <-ticker.C:
-			executeQuery(ctx, logger, name, queryCfg.SQL, timeout, pool)
+			start := time.Now()
+			queryCtx, cancel := context.WithTimeout(ctx, timeout)
+			var result any
+			err := pool.QueryRow(queryCtx, queryCfg.SQL).Scan(&result)
+			cancel()
+
+			duration := time.Since(start).Seconds()
+			queryDuration.WithLabelValues(name, queryCfg.DB).Observe(duration)
+
+			if err != nil {
+				queryErrors.WithLabelValues(name, queryCfg.DB).Inc()
+				logger.Error("query failed", "query", name, "error", err)
+				continue
+			}
+
+			logger.Info("query success", "query", name, "result", result, "duration", time.Since(start).String())
 		}
 	}
 }
 
-func executeQuery(
-	parentCtx context.Context,
-	logger *slog.Logger,
-	name string,
-	sql string,
-	timeout time.Duration,
-	pool *pgxpool.Pool,
-) {
-
-	queryCtx, cancel := context.WithTimeout(parentCtx, timeout)
-	defer cancel()
-
-	start := time.Now()
-
-	var result any
-	err := pool.QueryRow(queryCtx, sql).Scan(&result)
-
-	duration := time.Since(start)
-
+func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func()) {
+	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		logger.Error("query failed",
-			"query", name,
-			"error", err,
-			"duration", duration.String(),
-		)
+		logger.Error("failed to create watcher", "error", err)
+		return
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(path); err != nil {
+		logger.Error("failed to watch config", "error", err)
 		return
 	}
 
-	logger.Info("query success",
-		"query", name,
-		"result", result,
-		"duration", duration.String(),
-	)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event := <-watcher.Events:
+			if event.Op&fsnotify.Write == fsnotify.Write {
+				reload()
+			}
+		case err := <-watcher.Errors:
+			logger.Error("watcher error", "error", err)
+		}
+	}
 }

@@ -18,7 +18,13 @@ databases:
 queries:
   query1:
     db: "main"
-    sql: "SELECT 12"
+    sql: "SELECT 14"
+    timeout: "5s"
+    interval: "30s"
+
+  query3:
+    db: "main"
+    sql: "SELECT 14 from dual"
     timeout: "5s"
     interval: "30s"
 
