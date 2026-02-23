@@ -21,10 +21,17 @@ queries:
     sql: "SELECT 14"
     timeout: "5s"
     interval: "30s"
+    schedule:
+      timezone: "Europe/Moscow"
+      at:
+        - weekday: "wed"
+          time: "03:00"
+        - weekday: "mon"
+          time: "14:39"
 
   query4:
     db: "main"
-    sql: "SELECT 16"
+    sql: "SELECT 31"
     timeout: "5s"
     interval: "30s"
 
