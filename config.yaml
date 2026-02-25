@@ -1,16 +1,18 @@
 databases:
   main:
+    driver: "pgx"
     url: "postgres://admin:admin123@192.168.1.51:5432/mydb"
     max_conns: 10
-    min_conns: 2
+    max_idle_conns: 2        # переименовано из min_conns: правильная семантика database/sql
     max_conn_lifetime: "1h"
     max_conn_idle_time: "30m"
     health_check_period: "1m"
 
   somedb:
+    driver: "pgx"
     url: "postgres://admin:admin123@192.168.1.51:5432/somedb"
     max_conns: 10
-    min_conns: 2
+    max_idle_conns: 2        # переименовано из min_conns: правильная семантика database/sql
     max_conn_lifetime: "1h"
     max_conn_idle_time: "30m"
     health_check_period: "1m"

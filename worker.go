@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func startQueryWorker(
@@ -15,7 +15,7 @@ func startQueryWorker(
 	logger *slog.Logger,
 	name string,
 	queryCfg QueryConfig,
-	pool *pgxpool.Pool,
+	db *sql.DB,
 ) {
 	defer wg.Done()
 
@@ -25,7 +25,7 @@ func startQueryWorker(
 		return
 	}
 
-	// --- Scheduled mode (if schedule is provided) ---
+	// --- Scheduled mode ---
 	if queryCfg.Schedule != nil {
 		loc, entries, err := parseSchedule(queryCfg.Schedule)
 		if err != nil {
@@ -46,7 +46,7 @@ func startQueryWorker(
 				logger.Info("stopping query worker", "query", name)
 				return
 			case <-timer.C:
-				runOnce(ctx, logger, name, queryCfg, pool, timeout)
+				runOnce(ctx, logger, name, queryCfg, db, timeout)
 			}
 		}
 	}
@@ -69,7 +69,7 @@ func startQueryWorker(
 			logger.Info("stopping query worker", "query", name)
 			return
 		case <-ticker.C:
-			runOnce(ctx, logger, name, queryCfg, pool, timeout)
+			runOnce(ctx, logger, name, queryCfg, db, timeout)
 		}
 	}
 }
@@ -79,14 +79,14 @@ func runOnce(
 	logger *slog.Logger,
 	name string,
 	queryCfg QueryConfig,
-	pool *pgxpool.Pool,
+	db *sql.DB,
 	timeout time.Duration,
 ) {
 	start := time.Now()
 
 	queryCtx, cancel := context.WithTimeout(ctx, timeout)
 	var result any
-	err := pool.QueryRow(queryCtx, queryCfg.SQL).Scan(&result)
+	err := db.QueryRowContext(queryCtx, queryCfg.SQL).Scan(&result)
 	cancel()
 
 	duration := time.Since(start).Seconds()
@@ -126,6 +126,18 @@ func toFloat64(v any) (float64, bool) {
 		return float64(t), true
 	case float64:
 		return t, true
+	case []byte:
+		f, err := strconv.ParseFloat(string(t), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	case string:
+		f, err := strconv.ParseFloat(t, 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
 	default:
 		return 0, false
 	}

@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type worker struct {
@@ -16,8 +16,8 @@ type worker struct {
 }
 
 type dbPool struct {
-	cfg  DBConfig
-	pool *pgxpool.Pool
+	cfg DBConfig
+	db  *sql.DB
 }
 
 type app struct {
@@ -42,17 +42,23 @@ func (a *app) poolMetricsUpdater(period time.Duration) {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
+			// Делаем snapshot под локом, чтобы не держать его во время обновления метрик
 			a.mu.Lock()
+			snapshot := make(map[string]*dbPool, len(a.pools))
 			for name, p := range a.pools {
-				if p == nil || p.pool == nil {
-					continue
-				}
-				stat := p.pool.Stat()
-				dbPoolAcquired.WithLabelValues(name).Set(float64(stat.AcquiredConns()))
-				dbPoolIdle.WithLabelValues(name).Set(float64(stat.IdleConns()))
-				dbPoolTotal.WithLabelValues(name).Set(float64(stat.TotalConns()))
+				snapshot[name] = p
 			}
 			a.mu.Unlock()
+
+			for name, p := range snapshot {
+				if p == nil || p.db == nil {
+					continue
+				}
+				stat := p.db.Stats()
+				dbPoolAcquired.WithLabelValues(name).Set(float64(stat.InUse))
+				dbPoolIdle.WithLabelValues(name).Set(float64(stat.Idle))
+				dbPoolTotal.WithLabelValues(name).Set(float64(stat.OpenConnections))
+			}
 		}
 	}
 }
@@ -66,31 +72,27 @@ func (a *app) reload() {
 		return
 	}
 
-	// Важно: проверки duration делаем заранее, чтобы не получить NewTicker(0) panic.
 	if err := validateConfigDurations(newCfg); err != nil {
-		a.logger.Error("invalid config durations", "error", err)
+		a.logger.Error("invalid config", "error", err)
 		return
 	}
 
-	// 1) Обновляем/создаём пулы (вне lock — там I/O и сеть)
 	newPools, toClose := a.buildPools(newCfg.Databases)
 
-	// 2) Применяем изменения в рантайм-структуры под lock минимально
 	a.mu.Lock()
 	for name, p := range newPools {
 		a.pools[name] = p
 	}
 	a.mu.Unlock()
 
-	// закрытие старых пулов — уже без блокировки
+	// close old pools after unlock
 	for name, p := range toClose {
-		if p != nil && p.pool != nil {
+		if p != nil && p.db != nil {
 			a.logger.Info("closing old pool", "db", name)
-			p.pool.Close()
+			_ = p.db.Close()
 		}
 	}
 
-	// 3) Перезапускаем/запускаем воркеры
 	a.reconcileWorkers(newCfg.Queries)
 
 	a.logger.Info("smart reload complete")
@@ -100,7 +102,7 @@ func (a *app) buildPools(dbs map[string]DBConfig) (map[string]*dbPool, map[strin
 	newPools := make(map[string]*dbPool, len(dbs))
 	toClose := make(map[string]*dbPool)
 
-	// снимем текущий снапшот, чтобы сравнивать без удержания lock
+	// snapshot current pools
 	a.mu.Lock()
 	current := make(map[string]*dbPool, len(a.pools))
 	for k, v := range a.pools {
@@ -109,70 +111,65 @@ func (a *app) buildPools(dbs map[string]DBConfig) (map[string]*dbPool, map[strin
 	a.mu.Unlock()
 
 	for name, dbCfg := range dbs {
+		// normalize driver whitespace
+		dbCfg.Driver = strings.TrimSpace(dbCfg.Driver)
+
 		old, exists := current[name]
 		needUpdate := !exists ||
+			old.cfg.Driver != dbCfg.Driver ||
 			old.cfg.URL != dbCfg.URL ||
 			old.cfg.MaxConns != dbCfg.MaxConns ||
-			old.cfg.MinConns != dbCfg.MinConns
+			old.cfg.MaxIdleConns != dbCfg.MaxIdleConns ||
+			old.cfg.MaxConnLifetime != dbCfg.MaxConnLifetime ||
+			old.cfg.MaxConnIdleTime != dbCfg.MaxConnIdleTime ||
+			old.cfg.HealthCheckPeriod != dbCfg.HealthCheckPeriod
 
 		if !needUpdate {
 			newPools[name] = old
 			continue
 		}
 
-		// старый пул закрываем позже
-		if exists && old != nil && old.pool != nil {
+		if exists && old != nil && old.db != nil {
 			toClose[name] = old
 		}
 
-		pool, ok := a.createAndPingPool(name, dbCfg)
+		db, ok := a.createAndPingPool(name, dbCfg)
 		if !ok {
 			continue
 		}
 
 		newPools[name] = &dbPool{
-			cfg:  dbCfg,
-			pool: pool,
+			cfg: dbCfg,
+			db:  db,
 		}
 	}
 
 	return newPools, toClose
 }
 
-func (a *app) createAndPingPool(name string, dbCfg DBConfig) (*pgxpool.Pool, bool) {
-	poolCfg, err := pgxpool.ParseConfig(dbCfg.URL)
+func (a *app) createAndPingPool(name string, dbCfg DBConfig) (*sql.DB, bool) {
+	driver := strings.TrimSpace(dbCfg.Driver)
+	if driver == "" {
+		a.logger.Error("db driver is required", "db", name)
+		dbConnectionErrors.WithLabelValues(name).Inc()
+		return nil, false
+	}
+
+	dbCfg.Driver = driver
+
+	db, err := openAndPingDB(a.ctx, dbCfg)
 	if err != nil {
-		a.logger.Error("bad db config", "db", name, "error", err)
+		a.logger.Error("failed to open db", "db", name, "driver", dbCfg.Driver, "error", err)
 		dbConnectionErrors.WithLabelValues(name).Inc()
 		return nil, false
 	}
 
-	poolCfg.MaxConns = int32(dbCfg.MaxConns)
-	poolCfg.MinConns = int32(dbCfg.MinConns)
-
-	pool, err := pgxpool.NewWithConfig(a.ctx, poolCfg)
-	if err != nil {
-		a.logger.Error("failed to create pool", "db", name, "error", err)
-		dbConnectionErrors.WithLabelValues(name).Inc()
-		return nil, false
-	}
-
-	pingCtx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
-	defer cancel()
-
-	if err := pool.Ping(pingCtx); err != nil {
-		a.logger.Error("ping failed", "db", name, "error", err)
-		dbConnectionErrors.WithLabelValues(name).Inc()
-		pool.Close()
-		return nil, false
-	}
-
-	a.logger.Info("connected to database", "db", name)
-	return pool, true
+	a.logger.Info("connected to database", "db", name, "driver", dbCfg.Driver)
+	return db, true
 }
 
 func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
-	// снапшоты под коротким lock
+	// snapshots
 	a.mu.Lock()
 	currentWorkers := make(map[string]*worker, len(a.workers))
 	for k, v := range a.workers {
@@ -184,17 +181,15 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 	}
 	a.mu.Unlock()
 
-	// старт/рестарт
 	for name, q := range queries {
 		pEntry, ok := currentPools[q.DB]
-		if !ok || pEntry == nil || pEntry.pool == nil {
+		if !ok || pEntry == nil || pEntry.db == nil {
 			a.logger.Error("db not available for query", "query", name, "db", q.DB)
 			continue
 		}
 
 		w, exists := currentWorkers[name]
 		changed := !exists || !sameQueryConfig(w.cfg, q)
-
 		if !changed {
 			continue
 		}
@@ -209,7 +204,7 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 		wg.Add(1)
 		ctx, cancel := context.WithCancel(a.ctx)
 
-		go startQueryWorker(ctx, wg, a.logger, name, q, pEntry.pool)
+		go startQueryWorker(ctx, wg, a.logger, name, q, pEntry.db)
 
 		newW := &worker{cancel: cancel, wg: wg, cfg: q}
 
@@ -220,31 +215,43 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 		a.logger.Info("started new/updated query worker", "query", name)
 	}
 
-	// удалённые
+	// removed workers
 	a.mu.Lock()
 	for name, w := range a.workers {
 		if _, ok := queries[name]; !ok {
 			a.logger.Info("stopping removed query", "query", name)
 			w.cancel()
-			w.wg.Wait()
+			// Не держим lock во время Wait — воркер может попытаться взять a.mu.
+			// Сохраняем wg локально, разлочиваем, затем ждём.
+			wg := w.wg
 			delete(a.workers, name)
+			a.mu.Unlock()
+			wg.Wait()
+			a.mu.Lock()
 		}
 	}
 	a.mu.Unlock()
 }
 
 func (a *app) stopAllWorkers() {
+	// Собираем snapshot воркеров под локом, затем разлочиваем
+	// и только потом ждём завершения каждого.
+	// Это предотвращает потенциальный дедлок: если воркер в момент завершения
+	// попытается взять a.mu, при удержании лока в этом методе возникнет дедлок.
 	a.mu.Lock()
-	defer a.mu.Unlock()
-
+	workers := make([]*worker, 0, len(a.workers))
 	for _, w := range a.workers {
 		w.cancel()
+		workers = append(workers, w)
+	}
+	a.mu.Unlock()
+
+	for _, w := range workers {
 		w.wg.Wait()
 	}
 }
 
 func (a *app) closeAllPools() {
-	// Важно: close pools без удержания lock на время Close()
 	a.mu.Lock()
 	local := make(map[string]*dbPool, len(a.pools))
 	for name, p := range a.pools {
@@ -253,10 +260,10 @@ func (a *app) closeAllPools() {
 	a.mu.Unlock()
 
 	for name, p := range local {
-		if p == nil || p.pool == nil {
+		if p == nil || p.db == nil {
 			continue
 		}
 		a.logger.Info("closing pool", "db", name)
-		p.pool.Close()
+		_ = p.db.Close()
 	}
 }

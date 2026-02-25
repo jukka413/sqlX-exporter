@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -73,6 +74,11 @@ var (
 	metricsMu          sync.Mutex
 )
 
+// getOrCreateQueryMetric безопасно возвращает или создаёт GaugeVec для данного запроса.
+// Использует AlreadyRegisteredError вместо MustRegister, чтобы избежать паники при hot-reload:
+// если метрика уже была зарегистрирована (например, запрос удалили и добавили снова),
+// возвращается существующий коллектор.
+// См. документацию: https://pkg.go.dev/github.com/prometheus/client_golang/prometheus#AlreadyRegisteredError
 func getOrCreateQueryMetric(queryName string) *prometheus.GaugeVec {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
@@ -89,7 +95,22 @@ func getOrCreateQueryMetric(queryName string) *prometheus.GaugeVec {
 		[]string{"db"},
 	)
 
-	prometheus.MustRegister(metric)
+	if err := prometheus.Register(metric); err != nil {
+		are := &prometheus.AlreadyRegisteredError{}
+		if errors.As(err, are) {
+			// Метрика уже зарегистрирована ранее — используем существующую.
+			// Это нормальная ситуация при hot-reload конфига.
+			existing, ok := are.ExistingCollector.(*prometheus.GaugeVec)
+			if ok {
+				queryResultMetrics[queryName] = existing
+				return existing
+			}
+		}
+		// Любая другая ошибка регистрации — несовместимый коллектор,
+		// это программная ошибка, паника оправдана.
+		panic(err)
+	}
+
 	queryResultMetrics[queryName] = metric
 	return metric
 }
