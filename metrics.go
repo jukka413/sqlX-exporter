@@ -14,6 +14,27 @@ var (
 			Name: "app_query_errors_total",
 			Help: "Total number of query execution errors",
 		},
+		// reason: "timeout" | "db_error" | "cancelled"
+		[]string{"query", "db", "reason"},
+	)
+
+	// queryUp показывает успешность последнего выполнения запроса: 1 = успех, 0 = ошибка.
+	// Удобно для алертинга: alert when queryUp == 0 for > N minutes.
+	queryUp = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "app_query_up",
+			Help: "1 if last query execution was successful, 0 otherwise",
+		},
+		[]string{"query", "db"},
+	)
+
+	// queryLastSuccess — unix timestamp последнего успешного выполнения запроса.
+	// Позволяет алертить на зависание: time() - app_query_last_success_timestamp_seconds > threshold.
+	queryLastSuccess = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "app_query_last_success_timestamp_seconds",
+			Help: "Unix timestamp of the last successful query execution",
+		},
 		[]string{"query", "db"},
 	)
 
@@ -62,6 +83,8 @@ var (
 func init() {
 	prometheus.MustRegister(
 		queryErrors,
+		queryUp,
+		queryLastSuccess,
 		dbConnectionErrors,
 		queryDuration,
 		dbPoolAcquired,
@@ -158,4 +181,14 @@ func buildLabelValues(dbName string, customLabels map[string]string, colLabelVal
 		labels[k] = v
 	}
 	return labels
+}
+
+// lookupQueryMetric возвращает уже зарегистрированную GaugeVec для данного запроса.
+// Используется когда нужно удалить метрику (Delete) без её создания.
+// Возвращает (nil, false) если метрика ещё не была создана.
+func lookupQueryMetric(queryName string) (*prometheus.GaugeVec, bool) {
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
+	m, ok := queryResultMetrics[queryName]
+	return m, ok
 }

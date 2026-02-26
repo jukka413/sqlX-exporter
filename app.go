@@ -7,12 +7,18 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type worker struct {
 	cancel context.CancelFunc
 	wg     *sync.WaitGroup
 	cfg    QueryConfig
+	// prevLabels хранит лейблы последнего успешного multi-row запуска.
+	// Переносится в новый воркер при hot-reload чтобы reconciliation
+	// мог удалить метрики исчезнувших строк даже после перезапуска воркера.
+	prevLabels *[]prometheus.Labels
 }
 
 type dbPool struct {
@@ -200,13 +206,23 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 			w.wg.Wait()
 		}
 
+		// Переносим prevLabels из старого воркера если он существовал.
+		// Это позволяет reconciliation в новом воркере корректно удалить
+		// метрики строк, исчезнувших из результата запроса после reload.
+		var prevLabels *[]prometheus.Labels
+		if exists && w.prevLabels != nil {
+			prevLabels = w.prevLabels
+		} else {
+			prevLabels = &[]prometheus.Labels{}
+		}
+
 		wg := &sync.WaitGroup{}
 		wg.Add(1)
 		ctx, cancel := context.WithCancel(a.ctx)
 
-		go startQueryWorker(ctx, wg, a.logger, name, q, pEntry.db)
+		go startQueryWorker(ctx, wg, a.logger, name, q, pEntry.db, prevLabels)
 
-		newW := &worker{cancel: cancel, wg: wg, cfg: q}
+		newW := &worker{cancel: cancel, wg: wg, cfg: q, prevLabels: prevLabels}
 
 		a.mu.Lock()
 		a.workers[name] = newW

@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func startQueryWorker(
@@ -18,6 +22,7 @@ func startQueryWorker(
 	name string,
 	queryCfg QueryConfig,
 	db *sql.DB,
+	prevLabels *[]prometheus.Labels,
 ) {
 	defer wg.Done()
 
@@ -26,6 +31,9 @@ func startQueryWorker(
 		logger.Error("invalid timeout, worker stopped", "query", name, "error", err)
 		return
 	}
+
+	runner := newSingleRunner(ctx, logger, name, prevLabels)
+	defer runner.cancelCurrent()
 
 	// --- Scheduled mode ---
 	if queryCfg.Schedule != nil {
@@ -37,14 +45,9 @@ func startQueryWorker(
 
 		logger.Info("started scheduled query worker", "query", name)
 
-		runner := newSingleRunner(ctx, logger, name)
-		defer runner.cancelCurrent()
-
 		for {
 			nr := nextRun(time.Now(), loc, entries)
-			wait := time.Until(nr)
-
-			timer := time.NewTimer(wait)
+			timer := time.NewTimer(time.Until(nr))
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -68,9 +71,6 @@ func startQueryWorker(
 
 	logger.Info("started interval query worker", "query", name)
 
-	runner := newSingleRunner(ctx, logger, name)
-	defer runner.cancelCurrent()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -82,30 +82,41 @@ func startQueryWorker(
 	}
 }
 
-// singleRunner гарантирует, что в каждый момент времени выполняется не более одного запроса.
-// При вызове run() предыдущий запущенный запрос немедленно отменяется через context,
-// после чего запускается новый.
+// =========================================================================
+// singleRunner
+// =========================================================================
+
+// singleRunner гарантирует что в каждый момент времени выполняется не более одного запроса.
+// При вызове run() предыдущий запрос отменяется через context, новый запускается в горутине.
+//
+// Также хранит prevLabels — набор prometheus.Labels последнего успешного multi-row запуска.
+// При следующем запуске мы сравниваем его с текущим результатом и удаляем исчезнувшие строки.
 type singleRunner struct {
 	parentCtx     context.Context
 	logger        *slog.Logger
 	name          string
 	cancelCurrent context.CancelFunc
 	currentWg     sync.WaitGroup
+
+	// prevLabels — указатель на срез лейблов последнего успешного multi-row запуска.
+	// Указатель (а не значение) позволяет передавать состояние между воркерами при hot-reload:
+	// старый воркер и новый смотрят на одну и ту же память.
+	// Доступ безопасен: cancelCurrent+Wait гарантируют что старая горутина завершилась
+	// до того как новая начнёт читать/писать prevLabels.
+	prevLabels *[]prometheus.Labels
 }
 
-func newSingleRunner(parentCtx context.Context, logger *slog.Logger, name string) *singleRunner {
+func newSingleRunner(parentCtx context.Context, logger *slog.Logger, name string, prevLabels *[]prometheus.Labels) *singleRunner {
 	return &singleRunner{
 		parentCtx:     parentCtx,
 		logger:        logger,
 		name:          name,
-		cancelCurrent: func() {}, // no-op пока не было первого запуска
+		cancelCurrent: func() {},
+		prevLabels:    prevLabels,
 	}
 }
 
 func (r *singleRunner) run(queryCfg QueryConfig, db *sql.DB, timeout time.Duration) {
-	// Отменяем предыдущий запрос и ждём его завершения.
-	// context.WithCancel гарантирует, что db.QueryRowContext вернёт управление
-	// как только контекст будет отменён — даже если сервер БД ещё думает.
 	r.cancelCurrent()
 	r.currentWg.Wait()
 
@@ -116,15 +127,20 @@ func (r *singleRunner) run(queryCfg QueryConfig, db *sql.DB, timeout time.Durati
 	go func() {
 		defer r.currentWg.Done()
 		if runCtx.Err() != nil {
-			// parentCtx уже отменён (приложение останавливается)
 			return
 		}
-		runOnce(runCtx, r.logger, r.name, queryCfg, db, timeout)
+		updated := runOnce(runCtx, r.logger, r.name, queryCfg, db, timeout, *r.prevLabels)
+		*r.prevLabels = updated
 	}()
 }
 
-// -----
+// =========================================================================
+// runOnce
+// =========================================================================
 
+// runOnce выполняет один запуск запроса и возвращает обновлённый срез prevLabels
+// (для multi-row) или nil (для single-value).
+// prevLabels используется для reconciliation — удаления метрик исчезнувших строк.
 func runOnce(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -132,36 +148,77 @@ func runOnce(
 	queryCfg QueryConfig,
 	db *sql.DB,
 	timeout time.Duration,
-) {
+	prevLabels []prometheus.Labels,
+) (nextPrevLabels []prometheus.Labels) {
 	start := time.Now()
 
 	queryCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	var err error
+	var runErr error
 	if queryCfg.ValueColumn != "" {
-		err = runMultiRow(queryCtx, logger, name, queryCfg, db)
+		nextPrevLabels, runErr = runMultiRow(queryCtx, logger, name, queryCfg, db, prevLabels)
 	} else {
-		err = runSingleValue(queryCtx, logger, name, queryCfg, db)
+		runErr = runSingleValue(queryCtx, logger, name, queryCfg, db)
 	}
 
 	duration := time.Since(start).Seconds()
 	queryDuration.WithLabelValues(name, queryCfg.DB).Observe(duration)
 
-	if err != nil {
-		if ctx.Err() == context.Canceled {
+	if runErr != nil {
+		reason := classifyError(ctx, queryCtx)
+
+		if reason == "cancelled" {
+			// Запрос отменён следующим тиком — не ошибка, не трогаем метрики
 			logger.Info("query cancelled by next tick", "query", name, "elapsed", duration)
-			return
+			return prevLabels // возвращаем старые лейблы без изменений
 		}
-		queryErrors.WithLabelValues(name, queryCfg.DB).Inc()
-		logger.Error("query failed", "query", name, "error", err)
-		return
+
+		queryErrors.WithLabelValues(name, queryCfg.DB, reason).Inc()
+		queryUp.WithLabelValues(name, queryCfg.DB).Set(0)
+		logger.Error("query failed", "query", name, "reason", reason, "error", runErr)
+
+		// При ошибке удаляем все метрики предыдущего запуска —
+		// данные устарели и не должны оставаться на графиках
+		metric, exists := lookupQueryMetric(name)
+		if exists {
+			for _, lbl := range prevLabels {
+				metric.Delete(lbl)
+			}
+		}
+		// Возвращаем nil — после ошибки нет "предыдущего успешного набора"
+		return nil
 	}
 
+	queryUp.WithLabelValues(name, queryCfg.DB).Set(1)
+	queryLastSuccess.WithLabelValues(name, queryCfg.DB).SetToCurrentTime()
 	logger.Info("query success", "query", name, "duration", duration)
+
+	return nextPrevLabels
 }
 
-// runSingleValue — старое поведение: одна строка, один числовой столбец.
+// classifyError определяет причину ошибки для лейбла reason в queryErrors.
+//
+//   - "cancelled" — запрос отменён следующим тиком (ctx.Err() == Canceled)
+//   - "timeout"   — превышен таймаут (queryCtx истёк: DeadlineExceeded)
+//   - "db_error"  — ошибка на стороне БД
+func classifyError(workerCtx, queryCtx context.Context) string {
+	if workerCtx.Err() == context.Canceled {
+		return "cancelled"
+	}
+	if queryCtx.Err() != nil || errors.Is(queryCtx.Err(), context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "db_error"
+}
+
+// =========================================================================
+// runSingleValue
+// =========================================================================
+
+// runSingleValue — оригинальное поведение: SELECT возвращает одну строку с одним числом.
+// При ошибке удаляет метрику из Prometheus — она пропадёт с графиков в Grafana.
+// При успехе — устанавливает значение обратно.
 func runSingleValue(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -171,6 +228,11 @@ func runSingleValue(
 ) error {
 	var result any
 	if err := db.QueryRowContext(ctx, queryCfg.SQL).Scan(&result); err != nil {
+		// Удаляем метрику — данные устарели
+		metric, exists := lookupQueryMetric(name)
+		if exists {
+			metric.Delete(buildLabelValues(queryCfg.DB, queryCfg.Labels, nil))
+		}
 		return err
 	}
 
@@ -187,19 +249,27 @@ func runSingleValue(
 	return nil
 }
 
-// runMultiRow — новое поведение: несколько строк, value_column задаёт значение метрики,
-// остальные столбцы становятся лейблами. Каждая строка — отдельная метрика с уникальным
-// набором лейбл-значений.
+// =========================================================================
+// runMultiRow
+// =========================================================================
+
+// runMultiRow выполняет SELECT с несколькими строками. Каждая строка становится
+// отдельным time series в Prometheus. Столбцы кроме value_column — лейблы.
+//
+// Reconciliation: сравниваем текущий набор лейблов с prevLabels.
+// Строки, которые были в прошлом запуске но отсутствуют в текущем — удаляются из метрики.
+// Это обеспечивает что пропавшие из БД строки пропадают и с графиков Grafana.
 func runMultiRow(
 	ctx context.Context,
 	logger *slog.Logger,
 	name string,
 	queryCfg QueryConfig,
 	db *sql.DB,
-) error {
+	prevLabels []prometheus.Labels,
+) ([]prometheus.Labels, error) {
 	rows, err := db.QueryContext(ctx, queryCfg.SQL)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() {
 		if cerr := rows.Close(); cerr != nil {
@@ -207,13 +277,12 @@ func runMultiRow(
 		}
 	}()
 
-	// Получаем имена столбцов из результата запроса
 	colNames, err := rows.Columns()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// Проверяем что value_column присутствует в результате
+	// Находим индекс value_column
 	valueColIdx := -1
 	for i, col := range colNames {
 		if strings.EqualFold(col, queryCfg.ValueColumn) {
@@ -222,7 +291,7 @@ func runMultiRow(
 		}
 	}
 	if valueColIdx == -1 {
-		return fmt.Errorf("value_column %q not found in query result columns: %v",
+		return nil, fmt.Errorf("value_column %q not found in result columns: %v",
 			queryCfg.ValueColumn, colNames)
 	}
 
@@ -234,24 +303,23 @@ func runMultiRow(
 		}
 	}
 
-	// Создаём/получаем метрику с финальным набором лейблов.
-	// Это нужно сделать до итерации по строкам, чтобы зафиксировать лейблы один раз.
 	metric := getOrCreateQueryMetric(name, queryCfg.Labels, colLabelNames)
 
-	// Буфер для сканирования строки — все столбцы как any
+	// Буфер сканирования
 	scanBuf := make([]any, len(colNames))
 	scanPtrs := make([]any, len(colNames))
 	for i := range scanBuf {
 		scanPtrs[i] = &scanBuf[i]
 	}
 
-	rowCount := 0
+	// currentLabels — набор лейблов текущего запуска, для reconciliation
+	var currentLabels []prometheus.Labels
+
 	for rows.Next() {
 		if err := rows.Scan(scanPtrs...); err != nil {
-			return err
+			return nil, err
 		}
 
-		// Извлекаем значение метрики
 		value, ok := toFloat64(scanBuf[valueColIdx])
 		if !ok {
 			logger.Warn("skipping row: value column is not numeric",
@@ -262,7 +330,6 @@ func runMultiRow(
 			continue
 		}
 
-		// Собираем значения столбцов-лейблов в map
 		colLabelValues := make(map[string]string, len(colLabelNames))
 		for i, col := range colNames {
 			if i != valueColIdx {
@@ -270,22 +337,61 @@ func runMultiRow(
 			}
 		}
 
-		metric.With(buildLabelValues(queryCfg.DB, queryCfg.Labels, colLabelValues)).Set(value)
-		rowCount++
+		lbls := buildLabelValues(queryCfg.DB, queryCfg.Labels, colLabelValues)
+		metric.With(lbls).Set(value)
+		currentLabels = append(currentLabels, lbls)
 	}
 
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
 
-	if rowCount == 0 {
+	if len(currentLabels) == 0 {
 		logger.Warn("query returned 0 rows", "query", name)
 	}
 
-	return nil
+	// Reconciliation: удаляем строки которые были в прошлом запуске но исчезли сейчас.
+	// Строим set текущих лейблов для быстрого поиска.
+	currentSet := make(map[string]struct{}, len(currentLabels))
+	for _, lbl := range currentLabels {
+		currentSet[labelsKey(lbl)] = struct{}{}
+	}
+	for _, lbl := range prevLabels {
+		if _, exists := currentSet[labelsKey(lbl)]; !exists {
+			metric.Delete(lbl)
+			logger.Info("removed stale metric row", "query", name, "labels", lbl)
+		}
+	}
+
+	return currentLabels, nil
 }
 
-// anyToString конвертирует значение столбца в строку для использования как лейбл Prometheus.
+// labelsKey строит стабильный строковый ключ из prometheus.Labels.
+// Ключи сортируются явно — порядок итерации по map в Go не гарантирован,
+// и fmt.Sprintf("%v", map) не обеспечивает стабильности между вызовами.
+func labelsKey(lbl prometheus.Labels) string {
+	keys := make([]string, 0, len(lbl))
+	for k := range lbl {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var sb strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(k)
+		sb.WriteByte('=')
+		sb.WriteString(lbl[k])
+	}
+	return sb.String()
+}
+
+// =========================================================================
+// helpers
+// =========================================================================
+
 func anyToString(v any) string {
 	if v == nil {
 		return ""
