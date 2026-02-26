@@ -35,6 +35,9 @@ func startQueryWorker(
 
 		logger.Info("started scheduled query worker", "query", name)
 
+		runner := newSingleRunner(ctx, logger, name)
+		defer runner.cancelCurrent()
+
 		for {
 			nr := nextRun(time.Now(), loc, entries)
 			wait := time.Until(nr)
@@ -46,12 +49,12 @@ func startQueryWorker(
 				logger.Info("stopping query worker", "query", name)
 				return
 			case <-timer.C:
-				runOnce(ctx, logger, name, queryCfg, db, timeout)
+				runner.run(queryCfg, db, timeout)
 			}
 		}
 	}
 
-	// --- Interval mode (existing behaviour) ---
+	// --- Interval mode ---
 	interval, err := time.ParseDuration(queryCfg.Interval)
 	if err != nil {
 		logger.Error("invalid interval, worker stopped", "query", name, "error", err)
@@ -63,16 +66,62 @@ func startQueryWorker(
 
 	logger.Info("started interval query worker", "query", name)
 
+	runner := newSingleRunner(ctx, logger, name)
+	defer runner.cancelCurrent()
+
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Info("stopping query worker", "query", name)
 			return
 		case <-ticker.C:
-			runOnce(ctx, logger, name, queryCfg, db, timeout)
+			runner.run(queryCfg, db, timeout)
 		}
 	}
 }
+
+// singleRunner гарантирует, что в каждый момент времени выполняется не более одного запроса.
+// При вызове run() предыдущий запущенный запрос немедленно отменяется через context,
+// после чего запускается новый.
+type singleRunner struct {
+	parentCtx     context.Context
+	logger        *slog.Logger
+	name          string
+	cancelCurrent context.CancelFunc
+	currentWg     sync.WaitGroup
+}
+
+func newSingleRunner(parentCtx context.Context, logger *slog.Logger, name string) *singleRunner {
+	return &singleRunner{
+		parentCtx:     parentCtx,
+		logger:        logger,
+		name:          name,
+		cancelCurrent: func() {}, // no-op пока не было первого запуска
+	}
+}
+
+func (r *singleRunner) run(queryCfg QueryConfig, db *sql.DB, timeout time.Duration) {
+	// Отменяем предыдущий запрос и ждём его завершения.
+	// context.WithCancel гарантирует, что db.QueryRowContext вернёт управление
+	// как только контекст будет отменён — даже если сервер БД ещё думает.
+	r.cancelCurrent()
+	r.currentWg.Wait()
+
+	runCtx, cancel := context.WithCancel(r.parentCtx)
+	r.cancelCurrent = cancel
+
+	r.currentWg.Add(1)
+	go func() {
+		defer r.currentWg.Done()
+		if runCtx.Err() != nil {
+			// parentCtx уже отменён (приложение останавливается)
+			return
+		}
+		runOnce(runCtx, r.logger, r.name, queryCfg, db, timeout)
+	}()
+}
+
+// -----
 
 func runOnce(
 	ctx context.Context,
@@ -93,6 +142,12 @@ func runOnce(
 	queryDuration.WithLabelValues(name, queryCfg.DB).Observe(duration)
 
 	if err != nil {
+		// Отличаем намеренную отмену (новый тик пришёл раньше) от реальной ошибки БД.
+		// context.Canceled — это не ошибка, просто пришёл следующий тик.
+		if ctx.Err() == context.Canceled {
+			logger.Info("query cancelled by next tick", "query", name, "elapsed", duration)
+			return
+		}
 		queryErrors.WithLabelValues(name, queryCfg.DB).Inc()
 		logger.Error("query failed", "query", name, "error", err)
 		return
