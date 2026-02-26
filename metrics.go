@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"sort"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -59,12 +60,14 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(queryErrors)
-	prometheus.MustRegister(dbConnectionErrors)
-	prometheus.MustRegister(queryDuration)
-	prometheus.MustRegister(dbPoolAcquired)
-	prometheus.MustRegister(dbPoolIdle)
-	prometheus.MustRegister(dbPoolTotal)
+	prometheus.MustRegister(
+		queryErrors,
+		dbConnectionErrors,
+		queryDuration,
+		dbPoolAcquired,
+		dbPoolIdle,
+		dbPoolTotal,
+	)
 }
 
 // ================= Custom metrics ==========
@@ -75,11 +78,14 @@ var (
 )
 
 // getOrCreateQueryMetric безопасно возвращает или создаёт GaugeVec для данного запроса.
-// Использует AlreadyRegisteredError вместо MustRegister, чтобы избежать паники при hot-reload:
-// если метрика уже была зарегистрирована (например, запрос удалили и добавили снова),
-// возвращается существующий коллектор.
+//
+// Лейблы: всегда присутствует "db", к нему добавляются кастомные лейблы из конфига.
+// Порядок лейблов фиксируется при первом создании метрики — при hot-reload набор лейблов
+// должен совпадать, иначе вернётся существующая метрика со старым набором лейблов.
+//
+// Использует AlreadyRegisteredError вместо MustRegister, чтобы избежать паники при hot-reload.
 // См. документацию: https://pkg.go.dev/github.com/prometheus/client_golang/prometheus#AlreadyRegisteredError
-func getOrCreateQueryMetric(queryName string) *prometheus.GaugeVec {
+func getOrCreateQueryMetric(queryName string, customLabels map[string]string) *prometheus.GaugeVec {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
 
@@ -87,30 +93,53 @@ func getOrCreateQueryMetric(queryName string) *prometheus.GaugeVec {
 		return m
 	}
 
+	// Формируем упорядоченный список имён лейблов: сначала "db", затем кастомные
+	// в детерминированном (алфавитном) порядке — Prometheus требует стабильный порядок.
+	labelNames := buildLabelNames(customLabels)
+
 	metric := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: queryName,
 			Help: "SQL query result metric for " + queryName,
 		},
-		[]string{"db"},
+		labelNames,
 	)
 
 	if err := prometheus.Register(metric); err != nil {
 		are := &prometheus.AlreadyRegisteredError{}
 		if errors.As(err, are) {
-			// Метрика уже зарегистрирована ранее — используем существующую.
-			// Это нормальная ситуация при hot-reload конфига.
 			existing, ok := are.ExistingCollector.(*prometheus.GaugeVec)
 			if ok {
 				queryResultMetrics[queryName] = existing
 				return existing
 			}
 		}
-		// Любая другая ошибка регистрации — несовместимый коллектор,
-		// это программная ошибка, паника оправдана.
 		panic(err)
 	}
 
 	queryResultMetrics[queryName] = metric
 	return metric
+}
+
+// buildLabelNames возвращает упорядоченный список имён лейблов:
+// "db" всегда первый, затем кастомные в алфавитном порядке.
+func buildLabelNames(customLabels map[string]string) []string {
+	names := make([]string, 0, 1+len(customLabels))
+	names = append(names, "db")
+	for k := range customLabels {
+		names = append(names, k)
+	}
+	// Сортируем кастомные лейблы для детерминированного порядка
+	sort.Strings(names[1:])
+	return names
+}
+
+// buildLabelValues возвращает значения лейблов в том же порядке что buildLabelNames.
+func buildLabelValues(dbName string, customLabels map[string]string) prometheus.Labels {
+	labels := make(prometheus.Labels, 1+len(customLabels))
+	labels["db"] = dbName
+	for k, v := range customLabels {
+		labels[k] = v
+	}
+	return labels
 }

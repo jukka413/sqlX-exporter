@@ -159,8 +159,8 @@ func runOnce(
 		return
 	}
 
-	metric := getOrCreateQueryMetric(name)
-	metric.WithLabelValues(queryCfg.DB).Set(value)
+	metric := getOrCreateQueryMetric(name, queryCfg.Labels)
+	metric.With(buildLabelValues(queryCfg.DB, queryCfg.Labels)).Set(value)
 
 	logger.Info("query success",
 		"query", name,

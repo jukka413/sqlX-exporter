@@ -25,11 +25,16 @@ func validateSchedule(s *ScheduleConfig) error {
 		return errors.New("schedule.at is empty")
 	}
 	for _, a := range s.At {
-		if _, err := parseWeekday(a.Weekday); err != nil {
-			return err
+		// Валидируем каждый элемент через splitComma — поддерживаем "mon,wed" и "03:00,14:39"
+		for _, wd := range splitComma(a.Weekday) {
+			if _, err := parseWeekday(wd); err != nil {
+				return err
+			}
 		}
-		if _, _, err := parseHHMM(a.Time); err != nil {
-			return err
+		for _, t := range splitComma(a.Time) {
+			if _, _, err := parseHHMM(t); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -74,17 +79,26 @@ func parseSchedule(cfg *ScheduleConfig) (*time.Location, []scheduleEntry, error)
 		}
 	}
 
-	out := make([]scheduleEntry, 0, len(cfg.At))
+	var out []scheduleEntry
+
 	for _, a := range cfg.At {
-		wd, err := parseWeekday(a.Weekday)
-		if err != nil {
-			return nil, nil, err
+		weekdays := splitComma(a.Weekday)
+		times := splitComma(a.Time)
+
+		// Генерируем все комбинации weekday × time
+		for _, wdStr := range weekdays {
+			wd, err := parseWeekday(wdStr)
+			if err != nil {
+				return nil, nil, err
+			}
+			for _, tStr := range times {
+				h, m, err := parseHHMM(tStr)
+				if err != nil {
+					return nil, nil, err
+				}
+				out = append(out, scheduleEntry{weekday: wd, hour: h, min: m})
+			}
 		}
-		h, m, err := parseHHMM(a.Time)
-		if err != nil {
-			return nil, nil, err
-		}
-		out = append(out, scheduleEntry{weekday: wd, hour: h, min: m})
 	}
 
 	if len(out) == 0 {
@@ -110,6 +124,20 @@ func nextRun(now time.Time, loc *time.Location, entries []scheduleEntry) time.Ti
 		}
 	}
 	return best
+}
+
+// splitComma разбивает строку по запятой и триммирует пробелы.
+// "mon, wed" → ["mon", "wed"]
+// "mon"      → ["mon"]
+func splitComma(s string) []string {
+	parts := strings.Split(s, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			result = append(result, v)
+		}
+	}
+	return result
 }
 
 func parseHHMM(s string) (int, int, error) {

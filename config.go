@@ -42,6 +42,13 @@ type QueryConfig struct {
 	Interval string `yaml:"interval"`
 
 	Schedule *ScheduleConfig `yaml:"schedule,omitempty"`
+
+	// Labels — опциональные кастомные лейблы, которые будут добавлены к метрике запроса.
+	// Пример в config.yaml:
+	//   labels:
+	//     env: "prod"
+	//     team: "analytics"
+	Labels map[string]string `yaml:"labels,omitempty"`
 }
 
 type ScheduleConfig struct {

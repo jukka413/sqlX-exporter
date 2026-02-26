@@ -60,8 +60,8 @@ queries:
     schedule:
       timezone: "Europe/Moscow"
       at:
-        - weekday: "wed"
-          time: "03:00"
+        - weekday: "wed, thu"
+          time: "03:00, 15:46"
         - weekday: "mon"
           time: "14:39"
 
@@ -70,6 +70,8 @@ queries:
     sql: "SELECT 31"
     timeout: "5s"
     interval: "30s"
+    labels:
+      somelabel: "wtf"
 
   query3:
     db: "main"
