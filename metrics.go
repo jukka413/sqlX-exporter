@@ -79,13 +79,15 @@ var (
 
 // getOrCreateQueryMetric безопасно возвращает или создаёт GaugeVec для данного запроса.
 //
-// Лейблы: всегда присутствует "db", к нему добавляются кастомные лейблы из конфига.
-// Порядок лейблов фиксируется при первом создании метрики — при hot-reload набор лейблов
-// должен совпадать, иначе вернётся существующая метрика со старым набором лейблов.
+// Лейблы формируются из трёх источников (все опциональны):
+//   - "db"          — всегда присутствует
+//   - customLabels  — статические лейблы из поля labels: в конфиге
+//   - colLabels     — динамические лейблы из имён столбцов SELECT (для value_column режима)
 //
-// Использует AlreadyRegisteredError вместо MustRegister, чтобы избежать паники при hot-reload.
-// См. документацию: https://pkg.go.dev/github.com/prometheus/client_golang/prometheus#AlreadyRegisteredError
-func getOrCreateQueryMetric(queryName string, customLabels map[string]string) *prometheus.GaugeVec {
+// Порядок фиксируется при первом создании метрики. При hot-reload возвращается
+// существующий коллектор через AlreadyRegisteredError — паники нет.
+// См.: https://pkg.go.dev/github.com/prometheus/client_golang/prometheus#AlreadyRegisteredError
+func getOrCreateQueryMetric(queryName string, customLabels map[string]string, colLabels []string) *prometheus.GaugeVec {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
 
@@ -93,9 +95,7 @@ func getOrCreateQueryMetric(queryName string, customLabels map[string]string) *p
 		return m
 	}
 
-	// Формируем упорядоченный список имён лейблов: сначала "db", затем кастомные
-	// в детерминированном (алфавитном) порядке — Prometheus требует стабильный порядок.
-	labelNames := buildLabelNames(customLabels)
+	labelNames := buildLabelNames(customLabels, colLabels)
 
 	metric := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -122,23 +122,39 @@ func getOrCreateQueryMetric(queryName string, customLabels map[string]string) *p
 }
 
 // buildLabelNames возвращает упорядоченный список имён лейблов:
-// "db" всегда первый, затем кастомные в алфавитном порядке.
-func buildLabelNames(customLabels map[string]string) []string {
-	names := make([]string, 0, 1+len(customLabels))
+//  1. "db" — всегда первый
+//  2. статические лейблы из customLabels — в алфавитном порядке
+//  3. динамические лейблы из colLabels (имена столбцов) — в исходном порядке столбцов
+//
+// Такой порядок гарантирует стабильность между вызовами — Prometheus требует
+// чтобы имена и значения лейблов передавались в одном и том же порядке.
+func buildLabelNames(customLabels map[string]string, colLabels []string) []string {
+	names := make([]string, 0, 1+len(customLabels)+len(colLabels))
 	names = append(names, "db")
+
+	// Статические лейблы из конфига — сортируем для детерминированности
+	staticKeys := make([]string, 0, len(customLabels))
 	for k := range customLabels {
-		names = append(names, k)
+		staticKeys = append(staticKeys, k)
 	}
-	// Сортируем кастомные лейблы для детерминированного порядка
-	sort.Strings(names[1:])
+	sort.Strings(staticKeys)
+	names = append(names, staticKeys...)
+
+	// Динамические лейблы из столбцов — сохраняем порядок столбцов из SELECT
+	names = append(names, colLabels...)
+
 	return names
 }
 
-// buildLabelValues возвращает значения лейблов в том же порядке что buildLabelNames.
-func buildLabelValues(dbName string, customLabels map[string]string) prometheus.Labels {
-	labels := make(prometheus.Labels, 1+len(customLabels))
+// buildLabelValues возвращает map лейблов со значениями для передачи в metric.With().
+// Принимает те же три источника что buildLabelNames.
+func buildLabelValues(dbName string, customLabels map[string]string, colLabelValues map[string]string) prometheus.Labels {
+	labels := make(prometheus.Labels, 1+len(customLabels)+len(colLabelValues))
 	labels["db"] = dbName
 	for k, v := range customLabels {
+		labels[k] = v
+	}
+	for k, v := range colLabelValues {
 		labels[k] = v
 	}
 	return labels

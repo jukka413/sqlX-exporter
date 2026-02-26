@@ -73,6 +73,15 @@ queries:
     labels:
       somelabel: "wtf"
 
+  multiple_queries:
+    db: "main"
+    sql: "SELECT 31 as first, 'text' as query_label"
+    timeout: "5s"
+    interval: "30s"
+    value_column: "first"
+    labels:
+      somelabel: "wtf"
+
   query3:
     db: "main"
     sql: "SELECT 14 from dual"

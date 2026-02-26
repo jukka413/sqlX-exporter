@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -134,16 +136,19 @@ func runOnce(
 	start := time.Now()
 
 	queryCtx, cancel := context.WithTimeout(ctx, timeout)
-	var result any
-	err := db.QueryRowContext(queryCtx, queryCfg.SQL).Scan(&result)
-	cancel()
+	defer cancel()
+
+	var err error
+	if queryCfg.ValueColumn != "" {
+		err = runMultiRow(queryCtx, logger, name, queryCfg, db)
+	} else {
+		err = runSingleValue(queryCtx, logger, name, queryCfg, db)
+	}
 
 	duration := time.Since(start).Seconds()
 	queryDuration.WithLabelValues(name, queryCfg.DB).Observe(duration)
 
 	if err != nil {
-		// Отличаем намеренную отмену (новый тик пришёл раньше) от реальной ошибки БД.
-		// context.Canceled — это не ошибка, просто пришёл следующий тик.
 		if ctx.Err() == context.Canceled {
 			logger.Info("query cancelled by next tick", "query", name, "elapsed", duration)
 			return
@@ -153,20 +158,146 @@ func runOnce(
 		return
 	}
 
+	logger.Info("query success", "query", name, "duration", duration)
+}
+
+// runSingleValue — старое поведение: одна строка, один числовой столбец.
+func runSingleValue(
+	ctx context.Context,
+	logger *slog.Logger,
+	name string,
+	queryCfg QueryConfig,
+	db *sql.DB,
+) error {
+	var result any
+	if err := db.QueryRowContext(ctx, queryCfg.SQL).Scan(&result); err != nil {
+		return err
+	}
+
 	value, ok := toFloat64(result)
 	if !ok {
 		logger.Error("query result is not numeric", "query", name)
-		return
+		return nil
 	}
 
-	metric := getOrCreateQueryMetric(name, queryCfg.Labels)
-	metric.With(buildLabelValues(queryCfg.DB, queryCfg.Labels)).Set(value)
+	metric := getOrCreateQueryMetric(name, queryCfg.Labels, nil)
+	metric.With(buildLabelValues(queryCfg.DB, queryCfg.Labels, nil)).Set(value)
 
-	logger.Info("query success",
-		"query", name,
-		"value", value,
-		"duration", duration,
-	)
+	logger.Info("query value", "query", name, "value", value)
+	return nil
+}
+
+// runMultiRow — новое поведение: несколько строк, value_column задаёт значение метрики,
+// остальные столбцы становятся лейблами. Каждая строка — отдельная метрика с уникальным
+// набором лейбл-значений.
+func runMultiRow(
+	ctx context.Context,
+	logger *slog.Logger,
+	name string,
+	queryCfg QueryConfig,
+	db *sql.DB,
+) error {
+	rows, err := db.QueryContext(ctx, queryCfg.SQL)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := rows.Close(); cerr != nil {
+			logger.Warn("failed to close rows", "query", name, "error", cerr)
+		}
+	}()
+
+	// Получаем имена столбцов из результата запроса
+	colNames, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+
+	// Проверяем что value_column присутствует в результате
+	valueColIdx := -1
+	for i, col := range colNames {
+		if strings.EqualFold(col, queryCfg.ValueColumn) {
+			valueColIdx = i
+			break
+		}
+	}
+	if valueColIdx == -1 {
+		return fmt.Errorf("value_column %q not found in query result columns: %v",
+			queryCfg.ValueColumn, colNames)
+	}
+
+	// Имена столбцов-лейблов = все столбцы кроме value_column
+	colLabelNames := make([]string, 0, len(colNames)-1)
+	for i, col := range colNames {
+		if i != valueColIdx {
+			colLabelNames = append(colLabelNames, col)
+		}
+	}
+
+	// Создаём/получаем метрику с финальным набором лейблов.
+	// Это нужно сделать до итерации по строкам, чтобы зафиксировать лейблы один раз.
+	metric := getOrCreateQueryMetric(name, queryCfg.Labels, colLabelNames)
+
+	// Буфер для сканирования строки — все столбцы как any
+	scanBuf := make([]any, len(colNames))
+	scanPtrs := make([]any, len(colNames))
+	for i := range scanBuf {
+		scanPtrs[i] = &scanBuf[i]
+	}
+
+	rowCount := 0
+	for rows.Next() {
+		if err := rows.Scan(scanPtrs...); err != nil {
+			return err
+		}
+
+		// Извлекаем значение метрики
+		value, ok := toFloat64(scanBuf[valueColIdx])
+		if !ok {
+			logger.Warn("skipping row: value column is not numeric",
+				"query", name,
+				"value_column", queryCfg.ValueColumn,
+				"raw", scanBuf[valueColIdx],
+			)
+			continue
+		}
+
+		// Собираем значения столбцов-лейблов в map
+		colLabelValues := make(map[string]string, len(colLabelNames))
+		for i, col := range colNames {
+			if i != valueColIdx {
+				colLabelValues[col] = anyToString(scanBuf[i])
+			}
+		}
+
+		metric.With(buildLabelValues(queryCfg.DB, queryCfg.Labels, colLabelValues)).Set(value)
+		rowCount++
+	}
+
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if rowCount == 0 {
+		logger.Warn("query returned 0 rows", "query", name)
+	}
+
+	return nil
+}
+
+// anyToString конвертирует значение столбца в строку для использования как лейбл Prometheus.
+func anyToString(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case []byte:
+		return string(t)
+	case string:
+		return t
+	default:
+		return fmt.Sprintf("%v", t)
+	}
 }
 
 func toFloat64(v any) (float64, bool) {

@@ -43,12 +43,22 @@ type QueryConfig struct {
 
 	Schedule *ScheduleConfig `yaml:"schedule,omitempty"`
 
-	// Labels — опциональные кастомные лейблы, которые будут добавлены к метрике запроса.
-	// Пример в config.yaml:
+	// Labels — опциональные статические кастомные лейблы, добавляемые к метрике.
 	//   labels:
 	//     env: "prod"
 	//     team: "analytics"
 	Labels map[string]string `yaml:"labels,omitempty"`
+
+	// ValueColumn — имя столбца, значение которого становится значением метрики.
+	// Остальные столбцы автоматически становятся динамическими лейблами.
+	// Если не указан — старое поведение: SELECT возвращает одну строку с одним числом.
+	//
+	// Пример:
+	//   sql: "SELECT region, env, active_users FROM stats"
+	//   value_column: "active_users"
+	// Результат: my_metric{db="main", region="eu", env="prod"} 142
+	//            my_metric{db="main", region="us", env="prod"} 89
+	ValueColumn string `yaml:"value_column,omitempty"`
 }
 
 type ScheduleConfig struct {
