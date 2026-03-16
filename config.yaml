@@ -1,3 +1,6 @@
+settings:
+  db_reconnect_interval: "5m"   # как часто переподключаться к недоступным БД (default: 5m)
+
 databases:
   main:
     driver: "pgx"

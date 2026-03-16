@@ -24,12 +24,15 @@ func main() {
 	defer appCancel()
 
 	a := &app{
-		logger:     logger,
-		ctx:        appCtx,
-		cancel:     appCancel,
-		configPath: *configPath,
-		workers:    make(map[string]*worker),
-		pools:      make(map[string]*dbPool),
+		logger:            logger,
+		ctx:               appCtx,
+		cancel:            appCancel,
+		configPath:        *configPath,
+		workers:           make(map[string]*worker),
+		pools:             make(map[string]*dbPool),
+		failedPools:       make(map[string]DBConfig),
+		queriesCfg:        make(map[string]QueryConfig),
+		reconnectInterval: 5 * time.Minute, // дефолт до первого reload
 	}
 
 	// ---- Metrics server ----
@@ -48,6 +51,9 @@ func main() {
 
 	// ---- Pool metrics updater ----
 	go a.poolMetricsUpdater(5 * time.Second)
+
+	// ---- Pool health checker — переподключение к упавшим БД ----
+	go a.poolHealthChecker()
 
 	// First load
 	a.reload()

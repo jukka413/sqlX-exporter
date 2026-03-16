@@ -10,8 +10,30 @@ import (
 )
 
 type Config struct {
+	Settings  AppSettings            `yaml:"settings"`
 	Databases map[string]DBConfig    `yaml:"databases"`
 	Queries   map[string]QueryConfig `yaml:"queries"`
+}
+
+// AppSettings — глобальные настройки приложения.
+type AppSettings struct {
+	// DBReconnectInterval — как часто пытаться переподключиться к недоступным БД.
+	// Формат: Go duration string, например "5m", "30s", "1h".
+	// По умолчанию: 5m.
+	DBReconnectInterval string `yaml:"db_reconnect_interval,omitempty"`
+}
+
+// DBReconnectIntervalDuration возвращает интервал переподключения как time.Duration.
+// Если не задан или невалиден — возвращает дефолтные 5 минут.
+func (s AppSettings) DBReconnectIntervalDuration() time.Duration {
+	if s.DBReconnectInterval == "" {
+		return 5 * time.Minute
+	}
+	d, err := time.ParseDuration(s.DBReconnectInterval)
+	if err != nil {
+		return 5 * time.Minute
+	}
+	return d
 }
 
 type DBConfig struct {
@@ -68,6 +90,12 @@ func loadConfig(path string) (Config, error) {
 }
 
 func validateConfigDurations(cfg Config) error {
+	if cfg.Settings.DBReconnectInterval != "" {
+		if _, err := time.ParseDuration(cfg.Settings.DBReconnectInterval); err != nil {
+			return fmt.Errorf("settings.db_reconnect_interval is invalid: %w", err)
+		}
+	}
+
 	for name, db := range cfg.Databases {
 		if db.Driver == "" {
 			return fmt.Errorf("database %q: driver is required", name)
