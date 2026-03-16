@@ -15,24 +15,17 @@ type Config struct {
 }
 
 type DBConfig struct {
-	Driver string `yaml:"driver"` // e.g. "pgx", "sqlserver", "mysql", "godror"
-	URL    string `yaml:"url"`
+	Driver string `yaml:"driver"` // "pgx", "sqlserver", "mysql", "oracle"
 
-	MaxConns int `yaml:"max_conns"`
+	// Поддерживает подстановку env-переменных: "postgres://user:${DB_PASS}@host/db"
+	URL string `yaml:"url"`
 
-	// ИСПРАВЛЕНО: переименовано из min_conns в max_idle_conns.
-	// В database/sql нет понятия "минимальных соединений" — пул создаёт их лениво.
-	// SetMaxIdleConns задаёт максимальное количество ПРОСТАИВАЮЩИХ соединений,
-	// которые пул держит открытыми для повторного использования.
-	// Документация: https://pkg.go.dev/database/sql#DB.SetMaxIdleConns
-	// Важно: MaxIdleConns должен быть <= MaxConns, иначе Go автоматически его уменьшит.
+	MaxConns     int `yaml:"max_conns"`
 	MaxIdleConns int `yaml:"max_idle_conns"`
 
-	MaxConnLifetime string `yaml:"max_conn_lifetime,omitempty"`  // e.g. "1h"
-	MaxConnIdleTime string `yaml:"max_conn_idle_time,omitempty"` // e.g. "30m"
-
-	// Kept for backward compatibility, but ignored (by request).
-	HealthCheckPeriod string `yaml:"health_check_period,omitempty"` // e.g. "1m" (ignored)
+	MaxConnLifetime   string `yaml:"max_conn_lifetime,omitempty"`
+	MaxConnIdleTime   string `yaml:"max_conn_idle_time,omitempty"`
+	HealthCheckPeriod string `yaml:"health_check_period,omitempty"` // ignored
 }
 
 type QueryConfig struct {
@@ -43,22 +36,8 @@ type QueryConfig struct {
 
 	Schedule *ScheduleConfig `yaml:"schedule,omitempty"`
 
-	// Labels — опциональные статические кастомные лейблы, добавляемые к метрике.
-	//   labels:
-	//     env: "prod"
-	//     team: "analytics"
-	Labels map[string]string `yaml:"labels,omitempty"`
-
-	// ValueColumn — имя столбца, значение которого становится значением метрики.
-	// Остальные столбцы автоматически становятся динамическими лейблами.
-	// Если не указан — старое поведение: SELECT возвращает одну строку с одним числом.
-	//
-	// Пример:
-	//   sql: "SELECT region, env, active_users FROM stats"
-	//   value_column: "active_users"
-	// Результат: my_metric{db="main", region="eu", env="prod"} 142
-	//            my_metric{db="main", region="us", env="prod"} 89
-	ValueColumn string `yaml:"value_column,omitempty"`
+	Labels      map[string]string `yaml:"labels,omitempty"`
+	ValueColumn string            `yaml:"value_column,omitempty"`
 }
 
 type ScheduleConfig struct {
@@ -77,25 +56,29 @@ func loadConfig(path string) (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	err = yaml.Unmarshal(data, &cfg)
+
+	// Подставляем переменные окружения до парсинга YAML.
+	// Позволяет вставлять ${VAR} в любое место строки в конфиге, например:
+	//   url: "postgres://user:${DB_PASS}@host:5432/mydb"
+	// Переменные берутся из env Pod — монтируются через envFrom + ExternalSecret.
+	expanded := os.ExpandEnv(string(data))
+
+	err = yaml.Unmarshal([]byte(expanded), &cfg)
 	return cfg, err
 }
 
 func validateConfigDurations(cfg Config) error {
 	for name, db := range cfg.Databases {
 		if db.Driver == "" {
-			return fmt.Errorf("database %q driver is required", name)
+			return fmt.Errorf("database %q: driver is required", name)
 		}
 		if db.URL == "" {
-			return fmt.Errorf("database %q url is required", name)
+			return fmt.Errorf("database %q: url is required", name)
 		}
-
-		// Проверяем корректность соотношения MaxIdleConns и MaxConns
 		if db.MaxIdleConns > 0 && db.MaxConns > 0 && db.MaxIdleConns > db.MaxConns {
 			return fmt.Errorf("database %q: max_idle_conns (%d) must be <= max_conns (%d)",
 				name, db.MaxIdleConns, db.MaxConns)
 		}
-
 		if db.MaxConnLifetime != "" {
 			if _, err := time.ParseDuration(db.MaxConnLifetime); err != nil {
 				return fmt.Errorf("database %q has invalid max_conn_lifetime: %w", name, err)
@@ -117,7 +100,6 @@ func validateConfigDurations(cfg Config) error {
 		if _, err := time.ParseDuration(q.Timeout); err != nil {
 			return errors.New("query " + name + " has invalid timeout: " + err.Error())
 		}
-
 		if q.Schedule != nil {
 			if err := validateSchedule(q.Schedule); err != nil {
 				return fmt.Errorf("query %q has invalid schedule: %w", name, err)

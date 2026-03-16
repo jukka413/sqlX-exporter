@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,6 +15,9 @@ import (
 )
 
 func main() {
+	configPath := flag.String("config", "./config.yaml", "path to config file")
+	flag.Parse()
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	appCtx, appCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -23,21 +27,21 @@ func main() {
 		logger:     logger,
 		ctx:        appCtx,
 		cancel:     appCancel,
-		configPath: "./config.yaml",
+		configPath: *configPath,
 		workers:    make(map[string]*worker),
 		pools:      make(map[string]*dbPool),
 	}
 
 	// ---- Metrics server ----
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	metricsSrv := &http.Server{
+		Addr:              ":2112",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	go func() {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.Handler())
-		srv := &http.Server{
-			Addr:              ":2112",
-			Handler:           mux,
-			ReadHeaderTimeout: 5 * time.Second,
-		}
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("metrics server failed", "error", err)
 		}
 	}()
@@ -53,11 +57,18 @@ func main() {
 
 	<-a.ctx.Done()
 
-	a.logger.Info("shutting down workers")
+	logger.Info("shutting down workers")
 	a.stopAllWorkers()
 
-	a.logger.Info("closing pools")
+	logger.Info("closing pools")
 	a.closeAllPools()
 
-	a.logger.Info("application stopped gracefully")
+	// Graceful shutdown metrics server
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("metrics server shutdown error", "error", err)
+	}
+
+	logger.Info("application stopped gracefully")
 }

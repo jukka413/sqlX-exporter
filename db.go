@@ -15,15 +15,9 @@ func openAndPingDB(ctx context.Context, cfg DBConfig) (*sql.DB, error) {
 	if cfg.MaxConns > 0 {
 		db.SetMaxOpenConns(cfg.MaxConns)
 	}
-
-	// ИСПРАВЛЕНО: MaxIdleConns (бывший MinConns) правильно маппится в SetMaxIdleConns.
-	// SetMaxIdleConns задаёт максимум простаивающих соединений в пуле.
-	// В database/sql нет "минимальных" соединений — пул создаёт их по требованию.
-	// Документация: https://pkg.go.dev/database/sql#DB.SetMaxIdleConns
 	if cfg.MaxIdleConns > 0 {
 		db.SetMaxIdleConns(cfg.MaxIdleConns)
 	}
-
 	if cfg.MaxConnLifetime != "" {
 		d, err := time.ParseDuration(cfg.MaxConnLifetime)
 		if err != nil {
@@ -32,7 +26,6 @@ func openAndPingDB(ctx context.Context, cfg DBConfig) (*sql.DB, error) {
 		}
 		db.SetConnMaxLifetime(d)
 	}
-
 	if cfg.MaxConnIdleTime != "" {
 		d, err := time.ParseDuration(cfg.MaxConnIdleTime)
 		if err != nil {
@@ -41,8 +34,6 @@ func openAndPingDB(ctx context.Context, cfg DBConfig) (*sql.DB, error) {
 		}
 		db.SetConnMaxIdleTime(d)
 	}
-
-	// health_check_period intentionally ignored (as requested)
 
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

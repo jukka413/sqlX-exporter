@@ -20,7 +20,7 @@ databases:
 
   myoracle:
     driver: "oracle"
-    url: "oracle://user:password@host:1521/service_name"
+    url: "oracle://system:oracle@192.168.1.51:1521/xe"
     max_conns: 10
     max_idle_conns: 2
     max_conn_lifetime: "1h"
@@ -37,7 +37,7 @@ databases:
 
   my_mysql:
     driver: "mysql"
-    url: "user:password@tcp(host:3306)/dbname?parseTime=true&charset=utf8mb4"
+    url: "test:test@tcp(192.168.1.51:3306)/testdb?parseTime=true&charset=utf8mb4"
     max_conns: 10
     max_idle_conns: 2
     max_conn_lifetime: "1h"
@@ -45,7 +45,7 @@ databases:
 
   my_mssql:
     driver: "sqlserver"
-    url: "sqlserver://user:password@host:1433?database=dbname"
+    url: "sqlserver://sa:Str0ng_Passw0rd!2026@192.168.1.51:1433?database=master"
     max_conns: 10
     max_idle_conns: 2
     max_conn_lifetime: "1h"
@@ -75,7 +75,9 @@ queries:
 
   multiple_queries:
     db: "main"
-    sql: "SELECT 31 as first, 'text' as query_label"
+    sql: "SELECT 31 as first, 'text' as query_label
+          UNION ALL
+          SELECT 99 as first, 'delete_me' as query_label"
     timeout: "5s"
     interval: "30s"
     value_column: "first"
@@ -93,3 +95,21 @@ queries:
     sql: "SELECT 111"
     timeout: "5s"
     interval: "1m"
+
+  oracle_query:
+    db: "myoracle"
+    sql: "SELECT 14 from dual"
+    timeout: "5s"
+    interval: "30s"
+
+  mysql_query:
+    db: "my_mysql"
+    sql: "SELECT 654"
+    timeout: "5s"
+    interval: "30s"
+
+  mssql_query:
+    db: "my_mssql"
+    sql: "SELECT 333"
+    timeout: "5s"
+    interval: "30s"
