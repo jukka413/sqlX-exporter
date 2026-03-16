@@ -1,0 +1,22 @@
+# Git
+.git
+.gitignore
+
+# Helm chart — не нужен в образе
+helm/
+
+# Локальные конфиги с паролями — конфиг монтируется через ConfigMap/Secret
+config.yaml
+config*.yaml
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Тесты и документация
+*_test.go
+*.md
+
+# Бинарники если вдруг есть локальная сборка
+sqlx-exporter
