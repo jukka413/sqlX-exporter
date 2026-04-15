@@ -1,0 +1,6 @@
+apiVersion: v2
+name: sqlx-exporter
+description: Prometheus exporter that executes SQL queries and exposes results as metrics
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

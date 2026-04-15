@@ -1,0 +1,14 @@
+{{- if not .Values.existingSecret }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sqlx-exporter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlx-exporter.labels" . | nindent 4 }}
+data:
+  # Helm рендерит этот файл как есть — ${VAR} не трогается.
+  # Подстановка переменных происходит в Go (os.ExpandEnv) при старте Pod.
+  config.yaml: |
+    {{- .Values.config | toYaml | nindent 4 }}
+{{- end }}

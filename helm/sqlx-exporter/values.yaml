@@ -1,0 +1,131 @@
+replicaCount: 1
+
+image:
+  repository: siiitonik/sqlx-exporter
+  pullPolicy: IfNotPresent
+  tag: "latest"  # defaults to Chart.appVersion
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# =============================================================================
+# Конфигурация приложения
+# =============================================================================
+# ${VAR} в значениях подставляется из env при старте Pod (os.ExpandEnv в Go).
+# Helm НЕ трогает эти значения — они попадают в ConfigMap как есть.
+# Пароли передавай через envFrom → Secret (созданный ESO из Vault или вручную).
+config:
+  # Глобальные настройки (опционально)
+  settings:
+    db_reconnect_interval: "5m"   # интервал переподключения к упавшим БД
+
+  databases:
+    main:
+      driver: "pgx"
+      url: "postgres://myuser:${MAIN_DB_PASSWORD}@pg-host:5432/mydb"
+      max_conns: 10
+      max_idle_conns: 2
+      max_conn_lifetime: "1h"
+      max_conn_idle_time: "30m"
+  queries:
+    example_query:
+      db: "main"
+      sql: "SELECT 1"
+      timeout: "5s"
+      interval: "30s"
+
+# Имя готового Secret с ключом "config.yaml".
+# Если задан — ConfigMap не создаётся, конфиг берётся из этого Secret.
+# Пример: kubectl create secret generic my-cfg --from-file=config.yaml
+existingSecret: ""
+
+# =============================================================================
+# Переменные окружения
+# =============================================================================
+# envFrom монтирует Secret целиком как env-переменные.
+# Стандартный паттерн: ESO создаёт Secret из Vault → Pod читает через envFrom.
+envFrom: []
+  # - secretRef:
+#     name: sqlx-exporter-secrets   # Secret созданный ESO (см. helm/examples/externalsecret.yaml)
+
+# Отдельные переменные — для нечувствительных значений или переопределения.
+env: []
+  # - name: MAIN_DB_PASSWORD
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: sqlx-exporter-secrets
+#       key: MAIN_DB_PASSWORD
+
+# =============================================================================
+# ArgoCD
+# =============================================================================
+argocd:
+  # true  — Pod НЕ перезапускается при изменении ConfigMap (hot-reload через fsnotify).
+  # false — Pod перезапускается при изменении конфига (checksum аннотация).
+  # ВАЖНО: при смене пароля в Vault env обновляется только после рестарта Pod.
+  # Для автоматического рестарта при смене Secret используй Reloader от Stakater:
+  #   podAnnotations:
+  #     reloader.stakater.com/auto: "true"
+  hotReloadOnly: true
+
+service:
+  type: ClusterIP
+  port: 2112
+
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  interval: "30s"
+  scrapeTimeout: "10s"
+  labels: {}
+
+resources:
+  requests:
+    cpu: "50m"
+    memory: "32Mi"
+  limits:
+    cpu: "200m"
+    memory: "64Mi"
+
+livenessProbe:
+  httpGet:
+    path: /metrics
+    port: metrics
+  initialDelaySeconds: 5
+  periodSeconds: 15
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /metrics
+    port: metrics
+  initialDelaySeconds: 3
+  periodSeconds: 10
+
+# podSecurityContext — применяется ко всему Pod
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# containerSecurityContext — применяется к контейнеру приложения
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+podAnnotations: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
