@@ -46,6 +46,14 @@ COPY --from=builder /sqlx-exporter /sqlx-exporter
 # Дополнительно явно указываем для ясности и совместимости с k8s securityContext
 USER 65532:65532
 
+# GOGC=50 — запускать GC вдвое чаще чем по умолчанию (default=100).
+# Уменьшает пиковое потребление памяти за счёт небольшого роста CPU (~1-2%).
+# Для экспортёра с малым количеством горутин это оптимальный баланс.
+# GOMEMLIMIT задаёт мягкий лимит heap — Go будет агрессивнее запускать GC
+# когда приближается к лимиту. Установи чуть ниже resources.limits.memory.
+ENV GOGC=50
+ENV GOMEMLIMIT=55MiB
+
 EXPOSE 2112
 
 # config.yaml монтируется снаружи (ConfigMap в k8s или -v в docker run)

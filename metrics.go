@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
 var (
@@ -90,6 +91,17 @@ func init() {
 		dbPoolAcquired,
 		dbPoolIdle,
 		dbPoolTotal,
+	)
+
+	// Go runtime и process метрики — позволяют видеть реальное потребление памяти:
+	// go_memstats_heap_inuse_bytes  — heap занятый живыми объектами
+	// go_memstats_heap_idle_bytes   — heap зарезервированный но свободный
+	// go_memstats_sys_bytes         — всего запрошено у ОС
+	// go_gc_duration_seconds        — длительность GC пауз
+	// process_resident_memory_bytes — RSS процесса (то что видит k8s)
+	prometheus.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 }
 
