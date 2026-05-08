@@ -53,6 +53,11 @@ USER 65532:65532
 # когда приближается к лимиту. Установи чуть ниже resources.limits.memory.
 ENV GOGC=50
 ENV GOMEMLIMIT=55MiB
+# MADV_DONTNEED — немедленно возвращать свободные страницы ядру.
+# Без этого Go использует MADV_FREE (default на Linux) — страницы остаются
+# в RSS пока ядро не заберёт их под давлением. С MADV_DONTNEED RSS
+# точно отражает реальное потребление, скачков не будет.
+ENV GODEBUG=madvdontneed=1
 
 EXPOSE 2112
 

@@ -11,20 +11,23 @@ import (
 
 // watchConfig следит за изменениями конфигурационного файла и вызывает reload при обнаружении.
 //
-// Критичные исправления по сравнению с предыдущей версией:
+// Поведение в Kubernetes (ConfigMap/Secret volumes):
 //
-//  1. Наблюдаем за родительской ДИРЕКТОРИЕЙ, а не за самим файлом.
-//     Согласно документации fsnotify: "Watching individual files is generally not recommended
-//     as many programs (especially editors) update files atomically: it will write to a
-//     temporary file which is then moved to destination, overwriting the original.
-//     The watcher on the original file is now lost."
-//     Источник: https://pkg.go.dev/github.com/fsnotify/fsnotify
+//	kubelet обновляет файлы через AtomicWriter: создаёт новую директорию,
+//	записывает файлы, атомарно переключает симлинк ..data → новая директория,
+//	удаляет старую. В результате inotify получает IN_DELETE_SELF (Remove/Rename),
+//	а не IN_MODIFY/IN_CLOSE_WRITE как при обычном обновлении файла.
+//	Кроме того, после Remove inotify watch ломается и нужно переподписываться.
+//	Источник: https://ahmet.im/blog/kubernetes-inotify/
 //
-//  2. Фильтруем события по имени файла — реагируем только на наш config.
+// Поведение вне Kubernetes (обычная ФС, vim, nano и др.):
 //
-//  3. Добавлен debounce (150ms) для защиты от burst-событий:
-//     редакторы могут генерировать несколько событий Write/Create за одно сохранение,
-//     а также от параллельного вызова reload() из нескольких событий одновременно.
+//	Редакторы часто пишут через временный файл + rename → приходит Create.
+//	Прямая запись → приходит Write.
+//
+// Решение: следим за ДИРЕКТОРИЕЙ (не файлом), реагируем на Write/Create/Remove/Rename,
+// при Remove/Rename переподписываемся на директорию.
+// Debounce 150ms защищает от burst-событий.
 func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func()) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -33,7 +36,6 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 	}
 	defer watcher.Close()
 
-	// Наблюдаем за директорией, а не за файлом
 	dir := filepath.Dir(path)
 	absPath, err := filepath.Abs(path)
 	if err != nil {
@@ -48,7 +50,6 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 
 	logger.Info("watching config directory", "dir", dir, "file", absPath)
 
-	// debounce: задержка перед вызовом reload чтобы "дождаться тишины" после burst-событий
 	const debounceDelay = 150 * time.Millisecond
 	var debounceTimer *time.Timer
 
@@ -75,14 +76,37 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 				return
 			}
 
-			// Фильтруем: реагируем только на наш файл конфигурации
-			eventPath, err := filepath.Abs(event.Name)
-			if err != nil || eventPath != absPath {
+			// Фильтруем по имени файла — реагируем только на наш конфиг.
+			// В k8s события приходят на файлы внутри директории (..data, symlinks).
+			// Проверяем и прямое совпадение пути и совпадение базового имени —
+			// потому что в k8s реальный путь может быть вида:
+			// /etc/sqlx-exporter/..2024_04_24_12_00_00.123456789/config.yaml
+			eventAbs, _ := filepath.Abs(event.Name)
+			matchesDirect := eventAbs == absPath
+			matchesName := filepath.Base(event.Name) == filepath.Base(absPath)
+			// ..data — специальный симлинк который kubelet переключает атомарно
+			isDataSymlink := filepath.Base(event.Name) == "..data"
+
+			if !matchesDirect && !matchesName && !isDataSymlink {
 				continue
 			}
 
-			// Реагируем на запись и создание (Create покрывает atomic rename)
-			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
+			logger.Debug("watcher event", "op", event.Op, "file", event.Name)
+
+			switch {
+			case event.Has(fsnotify.Write) || event.Has(fsnotify.Create):
+				// Обычная ФС: прямая запись или atomic rename редактора
+				triggerReload()
+
+			case event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename):
+				// Kubernetes AtomicWriter: симлинк переключился → файл "удалён".
+				// Watch на директорию после Remove не ломается (в отличие от watch на файл),
+				// но переподписываемся на случай если директория была пересоздана.
+				_ = watcher.Remove(dir)
+				if err := watcher.Add(dir); err != nil {
+					logger.Error("failed to re-watch config directory after remove",
+						"dir", dir, "error", err)
+				}
 				triggerReload()
 			}
 
