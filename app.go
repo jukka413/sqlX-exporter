@@ -238,15 +238,21 @@ func (a *app) buildPools(dbs map[string]DBConfig) (newPools, toClose map[string]
 			continue
 		}
 
-		if exists && old != nil && old.db != nil {
-			toClose[name] = old
-		}
-
 		db, ok := a.createAndPingPool(name, dbCfg)
 		if !ok {
-			// Не удалось подключиться — запоминаем для повторных попыток
+			// Не удалось создать новый пул — старый пул НЕ закрываем.
+			// Воркеры продолжают работать с существующим подключением.
+			// Новый конфиг запоминаем в failedPools для повторных попыток.
+			if exists {
+				newPools[name] = old
+			}
 			failed[name] = dbCfg
 			continue
+		}
+
+		// Новый пул успешно создан — теперь можно закрыть старый
+		if exists && old != nil && old.db != nil {
+			toClose[name] = old
 		}
 
 		newPools[name] = &dbPool{cfg: dbCfg, db: db}
