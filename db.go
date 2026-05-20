@@ -31,23 +31,38 @@ func resolveDSN(cfg DBConfig) (string, error) {
 		return cfg.URL, nil
 	}
 
-	// Парсим oracle+tns://user:password@(DESCRIPTION=...)
-	// Отрезаем префикс, разбиваем на credentials и TNS-дескриптор
+	// Формат: oracle+tns://user:password@(DESCRIPTION=...)
+	// или:     oracle+tns://user:password@/?CONNSTR=(DESCRIPTION=...)
+	// Оба варианта нормализуем к чистому TNS-дескриптору для BuildJDBC.
 	rest := strings.TrimPrefix(cfg.URL, oracleTNSPrefix)
 
-	// Ищем @ после которого идёт TNS-дескриптор
 	atIdx := strings.Index(rest, "@")
 	if atIdx == -1 {
 		return "", fmt.Errorf("oracle+tns:// URL must contain @ before TNS descriptor")
 	}
 
-	credentials := rest[:atIdx] // "user:password"
-	tns := rest[atIdx+1:]       // "(DESCRIPTION=...)"
+	credentials := rest[:atIdx]
+	tns := rest[atIdx+1:]
 
-	// Разбиваем credentials на user и password
+	// Нормализуем варианты написания после @:
+	//   /?CONNSTR=(DESCRIPTION=...) → (DESCRIPTION=...)
+	//   /?(DESCRIPTION=...)         → (DESCRIPTION=...)
+	//   (DESCRIPTION=...)           → (DESCRIPTION=...) без изменений
+	for _, prefix := range []string{"/?CONNSTR=", "/?", "/?"} {
+		if strings.HasPrefix(tns, prefix) {
+			tns = strings.TrimPrefix(tns, prefix)
+			break
+		}
+	}
+	// Убираем ведущий / если остался
+	tns = strings.TrimPrefix(tns, "/")
+
+	// Убираем пробелы — в TNS дескрипторах пробелы между скобками валидны
+	// для человека но go-ora их не всегда корректно обрабатывает
+	tns = strings.Join(strings.Fields(tns), "")
+
 	user, password, _ := strings.Cut(credentials, ":")
 
-	// BuildJDBC собирает строку которую go-ora понимает с TNS-дескриптором
 	dsn := go_ora.BuildJDBC(user, password, tns, nil)
 	return dsn, nil
 }
