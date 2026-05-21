@@ -21,6 +21,11 @@ type AppSettings struct {
 	// Формат: Go duration string, например "5m", "30s", "1h".
 	// По умолчанию: 5m.
 	DBReconnectInterval string `yaml:"db_reconnect_interval,omitempty"`
+
+	// DefaultDB — имя БД которая используется если в запросе не указано поле db.
+	// Должна быть объявлена в секции databases.
+	// Пример: если default_db: "main", то запросы без db: берут подключение "main".
+	DefaultDB string `yaml:"default_db,omitempty"`
 }
 
 // DBReconnectIntervalDuration возвращает интервал переподключения как time.Duration.
@@ -79,20 +84,34 @@ func loadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 
-	// Подставляем переменные окружения до парсинга YAML.
-	// Позволяет вставлять ${VAR} в любое место строки в конфиге, например:
-	//   url: "postgres://user:${DB_PASS}@host:5432/mydb"
-	// Переменные берутся из env Pod — монтируются через envFrom + ExternalSecret.
-	expanded := os.ExpandEnv(string(data))
+	// Парсим YAML как есть — без ExpandEnv на весь файл.
+	// Применять os.ExpandEnv ко всему файлу нельзя: $ в SQL запросах
+	// (например v$session, gv$instance) будет воспринят как переменная окружения
+	// и затёрт пустой строкой.
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return cfg, err
+	}
 
-	err = yaml.Unmarshal([]byte(expanded), &cfg)
-	return cfg, err
+	// Подставляем переменные окружения только в поля url баз данных.
+	// Это позволяет писать: url: "postgres://user:${DB_PASS}@host:5432/mydb"
+	// не затрагивая SQL запросы.
+	for name, db := range cfg.Databases {
+		db.URL = os.ExpandEnv(db.URL)
+		cfg.Databases[name] = db
+	}
+
+	return cfg, nil
 }
 
 func validateConfigDurations(cfg Config) error {
 	if cfg.Settings.DBReconnectInterval != "" {
 		if _, err := time.ParseDuration(cfg.Settings.DBReconnectInterval); err != nil {
 			return fmt.Errorf("settings.db_reconnect_interval is invalid: %w", err)
+		}
+	}
+	if cfg.Settings.DefaultDB != "" {
+		if _, ok := cfg.Databases[cfg.Settings.DefaultDB]; !ok {
+			return fmt.Errorf("settings.default_db %q is not defined in databases", cfg.Settings.DefaultDB)
 		}
 	}
 
@@ -125,6 +144,15 @@ func validateConfigDurations(cfg Config) error {
 	}
 
 	for name, q := range cfg.Queries {
+		// q.DB может быть пустым если задан settings.default_db
+		if q.DB == "" && cfg.Settings.DefaultDB == "" {
+			return fmt.Errorf("query %q: db is required (or set settings.default_db)", name)
+		}
+		if q.DB != "" {
+			if _, ok := cfg.Databases[q.DB]; !ok {
+				return fmt.Errorf("query %q: db %q is not defined in databases", name, q.DB)
+			}
+		}
 		if _, err := time.ParseDuration(q.Timeout); err != nil {
 			return errors.New("query " + name + " has invalid timeout: " + err.Error())
 		}
