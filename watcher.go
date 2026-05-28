@@ -28,7 +28,10 @@ import (
 // Решение: следим за ДИРЕКТОРИЕЙ (не файлом), реагируем на Write/Create/Remove/Rename,
 // при Remove/Rename переподписываемся на директорию.
 // Debounce 150ms защищает от burst-событий.
-func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func()) {
+// watchConfig следит за основным конфигом и директориями инклюд-файлов.
+// extraDirs — дополнительные директории для наблюдения (из includes в конфиге).
+// При изменении любого файла в отслеживаемых директориях вызывается reload.
+func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func(), extraDirs ...string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		logger.Error("failed to create watcher", "error", err)
@@ -47,8 +50,25 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 		logger.Error("failed to watch config directory", "dir", dir, "error", err)
 		return
 	}
-
 	logger.Info("watching config directory", "dir", dir, "file", absPath)
+
+	// Следим за директориями инклюд-файлов
+	watchedDirs := map[string]struct{}{dir: {}}
+	for _, extraDir := range extraDirs {
+		absDir, err := filepath.Abs(extraDir)
+		if err != nil {
+			continue
+		}
+		if _, already := watchedDirs[absDir]; already {
+			continue
+		}
+		if err := watcher.Add(absDir); err != nil {
+			logger.Error("failed to watch include directory", "dir", absDir, "error", err)
+			continue
+		}
+		watchedDirs[absDir] = struct{}{}
+		logger.Info("watching include directory", "dir", absDir)
+	}
 
 	const debounceDelay = 150 * time.Millisecond
 	var debounceTimer *time.Timer

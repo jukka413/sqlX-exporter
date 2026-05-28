@@ -20,6 +20,13 @@ config:
   # Глобальные настройки (опционально)
   settings:
     db_reconnect_interval: "5m"   # интервал переподключения к упавшим БД
+    default_db: "main"            # БД по умолчанию для запросов без явного поля db
+
+  # Инклюд файлы из helm/sqlx-exporter/config/*.yaml подключаются автоматически.
+  # Перечисли их здесь — порядок определяет приоритет (последний побеждает).
+  includes:
+    - "oracle.yaml"
+    - "mssql.yaml"
 
   databases:
     main:
@@ -36,6 +43,26 @@ config:
       timeout: "5s"
       interval: "30s"
 
+# =============================================================================
+# Инклюд файлы конфига
+# =============================================================================
+# Основной способ: положить .yaml файл в helm/sqlx-exporter/config/ —
+# он автоматически попадёт в ConfigMap и будет смонтирован в Pod.
+# Указать его имя в config.includes выше.
+#
+# Дополнительный способ: прописать содержимое прямо здесь через configIncludes.
+# Удобно для небольших или динамически генерируемых конфигов.
+# Каждый ключ — имя файла, значение — содержимое.
+#
+# configIncludes:
+#   extra.yaml: |
+#     queries:
+#       extra_query:
+#         sql: "SELECT 1"
+#         timeout: "5s"
+#         interval: "30s"
+configIncludes: {}
+
 # Имя готового Secret с ключом "config.yaml".
 # Если задан — ConfigMap не создаётся, конфиг берётся из этого Secret.
 # Пример: kubectl create secret generic my-cfg --from-file=config.yaml
@@ -51,19 +78,20 @@ envFrom: []
 #     name: sqlx-exporter-secrets   # Secret созданный ESO (см. helm/examples/externalsecret.yaml)
 
 # Отдельные переменные — для нечувствительных значений или переопределения.
-env: []
-  # GOGC и GOMEMLIMIT уже заданы в Dockerfile.
-  # Переопредели здесь если нужны другие значения для конкретного деплоя.
-  # GOMEMLIMIT должен быть чуть ниже resources.limits.memory.
-  # - name: GOGC
-  #   value: "50"
-  # - name: GOMEMLIMIT
-  #   value: "55MiB"
-
-  # - name: MAIN_DB_PASSWORD
-  #   valueFrom:
-  #     secretKeyRef:
-  #       name: sqlx-exporter-secrets
+env:
+# GOGC, GOMEMLIMIT и GODEBUG уже заданы в Dockerfile.
+# Переопредели здесь если нужны другие значения для конкретного деплоя.
+# GOMEMLIMIT должен быть чуть ниже resources.limits.memory.
+# - name: GOGC
+#   value: "50"
+# - name: GOMEMLIMIT
+#   value: "55MiB"
+# - name: GODEBUG
+#   value: "madvdontneed=1"
+# - name: MAIN_DB_PASSWORD
+#   valueFrom:
+#     secretKeyRef:
+#       name: sqlx-exporter-secrets
 #       key: MAIN_DB_PASSWORD
 
 # =============================================================================

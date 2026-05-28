@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -58,8 +59,14 @@ func main() {
 	// First load
 	a.reload()
 
+	// Собираем директории инклюд-файлов для watcher
+	// После reload список инклюдов может измениться — watcher перезапустится
+	// через горутину если список изменился (упрощённо: следим за всеми директориями
+	// которые были в конфиге на старте; при добавлении нового include нужен рестарт).
+	includeDirs := collectIncludeDirs(a.configPath)
+
 	// FSNotify watcher
-	go watchConfig(a.ctx, a.logger, a.configPath, a.reload)
+	go watchConfig(a.ctx, a.logger, a.configPath, a.reload, includeDirs...)
 
 	<-a.ctx.Done()
 
@@ -77,4 +84,24 @@ func main() {
 	}
 
 	logger.Info("application stopped gracefully")
+}
+
+// collectIncludeDirs читает конфиг и возвращает директории всех инклюд-файлов.
+// Используется при старте чтобы настроить watcher на все нужные директории.
+func collectIncludeDirs(configPath string) []string {
+	cfg, err := loadConfig(configPath)
+	if err != nil || len(cfg.Includes) == 0 {
+		return nil
+	}
+	baseDir := filepath.Dir(configPath)
+	seen := map[string]struct{}{}
+	var dirs []string
+	for _, inc := range cfg.Includes {
+		dir := filepath.Dir(filepath.Join(baseDir, inc))
+		if _, ok := seen[dir]; !ok {
+			seen[dir] = struct{}{}
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
 }

@@ -4,13 +4,20 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Settings  AppSettings            `yaml:"settings"`
+	Settings AppSettings `yaml:"settings"`
+	// Includes — список путей к дополнительным конфиг файлам.
+	// Пути относительны к директории основного конфига.
+	// Инклюд файлы могут содержать databases и queries.
+	// При конфликте ключей — основной файл имеет приоритет.
+	// Поддерживается рекурсия: инклюд может инклюдить другие файлы.
+	Includes  []string               `yaml:"includes,omitempty"`
 	Databases map[string]DBConfig    `yaml:"databases"`
 	Queries   map[string]QueryConfig `yaml:"queries"`
 }
@@ -77,30 +84,90 @@ type ScheduleAt struct {
 	Time    string `yaml:"time"`
 }
 
+// loadConfig загружает конфиг из файла path и рекурсивно обрабатывает includes.
+// includes мержатся в основной конфиг — основной файл имеет приоритет при конфликте ключей.
 func loadConfig(path string) (Config, error) {
+	return loadConfigWithDepth(path, 0)
+}
+
+// maxIncludeDepth ограничивает глубину рекурсии инклюдов для защиты от циклических ссылок.
+const maxIncludeDepth = 10
+
+func loadConfigWithDepth(path string, depth int) (Config, error) {
 	var cfg Config
+
+	if depth > maxIncludeDepth {
+		return cfg, fmt.Errorf("include depth limit (%d) exceeded at %q — possible circular include", maxIncludeDepth, path)
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return cfg, err
 	}
 
-	// Парсим YAML как есть — без ExpandEnv на весь файл.
-	// Применять os.ExpandEnv ко всему файлу нельзя: $ в SQL запросах
-	// (например v$session, gv$instance) будет воспринят как переменная окружения
-	// и затёрт пустой строкой.
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, err
 	}
 
-	// Подставляем переменные окружения только в поля url баз данных.
-	// Это позволяет писать: url: "postgres://user:${DB_PASS}@host:5432/mydb"
-	// не затрагивая SQL запросы.
+	// Подставляем переменные окружения только в url — не затрагиваем SQL.
+	// $ в SQL запросах (v$session, gv$instance) не должен интерпретироваться.
+	expandURLs(&cfg)
+
+	// Обрабатываем инклюды — рекурсивно загружаем и мержим
+	if len(cfg.Includes) > 0 {
+		baseDir := filepath.Dir(path)
+		for _, includePath := range cfg.Includes {
+			fullPath := filepath.Join(baseDir, includePath)
+			inc, err := loadConfigWithDepth(fullPath, depth+1)
+			if err != nil {
+				return cfg, fmt.Errorf("include %q: %w", fullPath, err)
+			}
+			// Инклюды применяются последовательно и перезаписывают основной конфиг.
+			// Последний инклюд в списке имеет наивысший приоритет.
+			mergeConfig(&cfg, inc)
+		}
+		// Очищаем includes из финального конфига — они уже обработаны
+		cfg.Includes = nil
+	}
+
+	return cfg, nil
+}
+
+// expandURLs подставляет переменные окружения только в поля url баз данных.
+func expandURLs(cfg *Config) {
 	for name, db := range cfg.Databases {
 		db.URL = os.ExpandEnv(db.URL)
 		cfg.Databases[name] = db
 	}
+}
 
-	return cfg, nil
+// mergeConfig мержит src в dst.
+// Инклюд (src) имеет приоритет — перезаписывает существующие ключи в dst.
+// Порядок инклюдов в списке includes определяет приоритет: последний побеждает.
+func mergeConfig(dst *Config, src Config) {
+	// Settings: инклюд перезаписывает если задан
+	if src.Settings.DBReconnectInterval != "" {
+		dst.Settings.DBReconnectInterval = src.Settings.DBReconnectInterval
+	}
+	if src.Settings.DefaultDB != "" {
+		dst.Settings.DefaultDB = src.Settings.DefaultDB
+	}
+
+	// Databases: инклюд перезаписывает существующие и добавляет новые
+	if dst.Databases == nil {
+		dst.Databases = make(map[string]DBConfig)
+	}
+	for name, db := range src.Databases {
+		dst.Databases[name] = db
+	}
+
+	// Queries: инклюд перезаписывает существующие и добавляет новые
+	if dst.Queries == nil {
+		dst.Queries = make(map[string]QueryConfig)
+	}
+	for name, q := range src.Queries {
+		dst.Queries[name] = q
+	}
 }
 
 func validateConfigDurations(cfg Config) error {

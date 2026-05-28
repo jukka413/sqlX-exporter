@@ -1,4 +1,11 @@
 {{- if not .Values.existingSecret }}
+{{- /*
+  Автоматически собираем список инклюд-файлов из папки config/.
+  Files.Glob читает все .yaml файлы из chart/config/ и кладёт их в ConfigMap.
+  Приложение получает их смонтированными в /etc/sqlx-exporter/ рядом с config.yaml
+  и подключает через секцию includes: в основном конфиге.
+*/}}
+{{- $includeFiles := .Files.Glob "config/*.yaml" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -7,8 +14,22 @@ metadata:
   labels:
     {{- include "sqlx-exporter.labels" . | nindent 4 }}
 data:
-  # Helm рендерит этот файл как есть — ${VAR} не трогается.
-  # Подстановка переменных происходит в Go (os.ExpandEnv) при старте Pod.
+  # Основной конфиг — ${VAR} не трогается Helm, подставляется в Go через os.ExpandEnv.
   config.yaml: |
     {{- .Values.config | toYaml | nindent 4 }}
+
+  {{- if $includeFiles }}
+  # Инклюд файлы из helm/sqlx-exporter/config/*.yaml
+  # Монтируются рядом с config.yaml, подключаются через includes: в конфиге.
+  {{- range $path, $content := $includeFiles }}
+  {{ base $path }}: |
+    {{- $content | toString | nindent 4 }}
+  {{- end }}
+  {{- end }}
+
+  {{- range $filename, $content := .Values.configIncludes }}
+  # Инклюд из values.configIncludes
+  {{ $filename }}: |
+    {{- $content | nindent 4 }}
+  {{- end }}
 {{- end }}
