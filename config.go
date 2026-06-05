@@ -12,12 +12,23 @@ import (
 
 type Config struct {
 	Settings AppSettings `yaml:"settings"`
+
+	// DefaultDB — локальная БД по умолчанию для запросов в этом файле.
+	// Работает на уровне каждого файла независимо — в основном конфиге и
+	// в каждом инклюде можно задать свою, они не перезатирают друг друга.
+	// Запросы без явного поля db: получат это значение при загрузке файла.
+	//
+	// Отличие от settings.default_db:
+	//   - default_db здесь: подставляется в запросы этого файла при загрузке
+	//   - settings.default_db: глобальный фолбэк для запросов без db: после мержа всех файлов
+	DefaultDB string `yaml:"default_db,omitempty"`
+
 	// Includes — список путей к дополнительным конфиг файлам.
 	// Пути относительны к директории основного конфига.
-	// Инклюд файлы могут содержать databases и queries.
-	// При конфликте ключей — основной файл имеет приоритет.
+	// Инклюд файлы могут содержать databases, queries и свой default_db.
 	// Поддерживается рекурсия: инклюд может инклюдить другие файлы.
-	Includes  []string               `yaml:"includes,omitempty"`
+	Includes []string `yaml:"includes,omitempty"`
+
 	Databases map[string]DBConfig    `yaml:"databases"`
 	Queries   map[string]QueryConfig `yaml:"queries"`
 }
@@ -25,18 +36,15 @@ type Config struct {
 // AppSettings — глобальные настройки приложения.
 type AppSettings struct {
 	// DBReconnectInterval — как часто пытаться переподключиться к недоступным БД.
-	// Формат: Go duration string, например "5m", "30s", "1h".
-	// По умолчанию: 5m.
 	DBReconnectInterval string `yaml:"db_reconnect_interval,omitempty"`
 
-	// DefaultDB — имя БД которая используется если в запросе не указано поле db.
-	// Должна быть объявлена в секции databases.
-	// Пример: если default_db: "main", то запросы без db: берут подключение "main".
+	// DefaultDB — глобальный фолбэк для запросов без db: после мержа всех файлов.
+	// Используется только если запрос не получил db: ни из своего файла (default_db),
+	// ни явно. Должна быть объявлена в секции databases итогового конфига.
 	DefaultDB string `yaml:"default_db,omitempty"`
 }
 
 // DBReconnectIntervalDuration возвращает интервал переподключения как time.Duration.
-// Если не задан или невалиден — возвращает дефолтные 5 минут.
 func (s AppSettings) DBReconnectIntervalDuration() time.Duration {
 	if s.DBReconnectInterval == "" {
 		return 5 * time.Minute
@@ -49,17 +57,15 @@ func (s AppSettings) DBReconnectIntervalDuration() time.Duration {
 }
 
 type DBConfig struct {
-	Driver string `yaml:"driver"` // "pgx", "sqlserver", "mysql", "oracle"
-
-	// Поддерживает подстановку env-переменных: "postgres://user:${DB_PASS}@host/db"
-	URL string `yaml:"url"`
+	Driver string `yaml:"driver"`
+	URL    string `yaml:"url"`
 
 	MaxConns     int `yaml:"max_conns"`
 	MaxIdleConns int `yaml:"max_idle_conns"`
 
 	MaxConnLifetime   string `yaml:"max_conn_lifetime,omitempty"`
 	MaxConnIdleTime   string `yaml:"max_conn_idle_time,omitempty"`
-	HealthCheckPeriod string `yaml:"health_check_period,omitempty"` // ignored
+	HealthCheckPeriod string `yaml:"health_check_period,omitempty"`
 }
 
 type QueryConfig struct {
@@ -85,15 +91,33 @@ type ScheduleAt struct {
 }
 
 // loadConfig загружает конфиг из файла path и рекурсивно обрабатывает includes.
-// includes мержатся в основной конфиг — основной файл имеет приоритет при конфликте ключей.
 func loadConfig(path string) (Config, error) {
-	return loadConfigWithDepth(path, 0)
+	// Сначала делаем предварительную загрузку чтобы получить settings.default_db,
+	// затем перезагружаем с передачей его как parentDefaultDB для инклюдов.
+	// Это позволяет settings.default_db из основного конфига работать как глобальный
+	// фолбэк для всех вложенных файлов без своего default_db.
+	var preview Config
+	if data, err := os.ReadFile(path); err == nil {
+		_ = yaml.Unmarshal(data, &preview)
+	}
+	globalDefault := preview.DefaultDB
+	if globalDefault == "" {
+		globalDefault = preview.Settings.DefaultDB
+	}
+	return loadConfigWithContext(path, 0, globalDefault)
 }
 
-// maxIncludeDepth ограничивает глубину рекурсии инклюдов для защиты от циклических ссылок.
 const maxIncludeDepth = 10
 
 func loadConfigWithDepth(path string, depth int) (Config, error) {
+	return loadConfigWithContext(path, depth, "")
+}
+
+// loadConfigWithContext загружает конфиг передавая parentDefaultDB из родительского файла.
+// Если у текущего файла нет своего default_db — используется parentDefaultDB.
+// Это позволяет глобальному default_db из основного конфига распространяться
+// на все вложенные файлы у которых нет своего локального default_db.
+func loadConfigWithContext(path string, depth int, parentDefaultDB string) (Config, error) {
 	var cfg Config
 
 	if depth > maxIncludeDepth {
@@ -110,27 +134,48 @@ func loadConfigWithDepth(path string, depth int) (Config, error) {
 	}
 
 	// Подставляем переменные окружения только в url — не затрагиваем SQL.
-	// $ в SQL запросах (v$session, gv$instance) не должен интерпретироваться.
 	expandURLs(&cfg)
 
-	// Обрабатываем инклюды — рекурсивно загружаем и мержим
+	// Определяем эффективный default_db для этого файла:
+	// - если у файла есть свой → используем его
+	// - если нет → берём от родителя (основного конфига или settings.default_db)
+	effectiveDefaultDB := cfg.DefaultDB
+	if effectiveDefaultDB == "" {
+		effectiveDefaultDB = parentDefaultDB
+	}
+
+	// Подставляем эффективный default_db в запросы без явного db:
+	if effectiveDefaultDB != "" {
+		applyDefaultDB(&cfg, effectiveDefaultDB)
+	}
+
+	// Обрабатываем инклюды — передаём эффективный default_db дочерним файлам
 	if len(cfg.Includes) > 0 {
 		baseDir := filepath.Dir(path)
 		for _, includePath := range cfg.Includes {
 			fullPath := filepath.Join(baseDir, includePath)
-			inc, err := loadConfigWithDepth(fullPath, depth+1)
+			inc, err := loadConfigWithContext(fullPath, depth+1, effectiveDefaultDB)
 			if err != nil {
 				return cfg, fmt.Errorf("include %q: %w", fullPath, err)
 			}
-			// Инклюды применяются последовательно и перезаписывают основной конфиг.
-			// Последний инклюд в списке имеет наивысший приоритет.
 			mergeConfig(&cfg, inc)
 		}
-		// Очищаем includes из финального конфига — они уже обработаны
 		cfg.Includes = nil
 	}
 
 	return cfg, nil
+}
+
+// applyDefaultDB подставляет defaultDB в запросы файла у которых db не указан.
+// defaultDB может быть локальным (из самого файла) или унаследованным от родителя.
+// Запросы с явным db: не затрагиваются.
+func applyDefaultDB(cfg *Config, defaultDB string) {
+	for name, q := range cfg.Queries {
+		if q.DB == "" {
+			q.DB = defaultDB
+			cfg.Queries[name] = q
+		}
+	}
 }
 
 // expandURLs подставляет переменные окружения только в поля url баз данных.
@@ -145,7 +190,6 @@ func expandURLs(cfg *Config) {
 // Инклюд (src) имеет приоритет — перезаписывает существующие ключи в dst.
 // Порядок инклюдов в списке includes определяет приоритет: последний побеждает.
 func mergeConfig(dst *Config, src Config) {
-	// Settings: инклюд перезаписывает если задан
 	if src.Settings.DBReconnectInterval != "" {
 		dst.Settings.DBReconnectInterval = src.Settings.DBReconnectInterval
 	}
@@ -153,7 +197,6 @@ func mergeConfig(dst *Config, src Config) {
 		dst.Settings.DefaultDB = src.Settings.DefaultDB
 	}
 
-	// Databases: инклюд перезаписывает существующие и добавляет новые
 	if dst.Databases == nil {
 		dst.Databases = make(map[string]DBConfig)
 	}
@@ -161,7 +204,6 @@ func mergeConfig(dst *Config, src Config) {
 		dst.Databases[name] = db
 	}
 
-	// Queries: инклюд перезаписывает существующие и добавляет новые
 	if dst.Queries == nil {
 		dst.Queries = make(map[string]QueryConfig)
 	}
@@ -211,9 +253,8 @@ func validateConfigDurations(cfg Config) error {
 	}
 
 	for name, q := range cfg.Queries {
-		// q.DB может быть пустым если задан settings.default_db
 		if q.DB == "" && cfg.Settings.DefaultDB == "" {
-			return fmt.Errorf("query %q: db is required (or set settings.default_db)", name)
+			return fmt.Errorf("query %q: db is required (or set default_db / settings.default_db)", name)
 		}
 		if q.DB != "" {
 			if _, ok := cfg.Databases[q.DB]; !ok {
