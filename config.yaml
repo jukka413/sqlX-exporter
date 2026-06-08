@@ -2,6 +2,20 @@ settings:
   db_reconnect_interval: "5m"   # как часто переподключаться к недоступным БД (default: 5m)
   default_db: "main"
 
+# Маппинг: файл с метриками → БД по умолчанию.
+# Строка — одна БД, список — файл клонируется для каждой БД.
+include_defaults:
+  oracle-metrics.yaml:
+    - "azdh_oracle"
+    - "ir_test_oracle"    # те же запросы выполнятся и для второй Oracle
+  mssql-metrics.yaml: "main_mssql"   # одна БД — просто строка
+  pg-metrics.yaml: "main"
+
+includes:
+  - "oracle-metrics.yaml"
+  - "mssql-metrics.yaml"
+  - "pg-metrics.yaml"
+  -
 databases:
   main:
     driver: "pgx"

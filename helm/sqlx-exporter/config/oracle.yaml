@@ -1,17 +1,3 @@
-# default_db применяется только к запросам в этом файле.
-# Запросы без явного db: получат "azdh_oracle" автоматически.
-# Не затрагивает запросы из других инклюдов или основного конфига.
-default_db: "azdh_oracle"
-
-databases:
-  azdh_oracle:
-    driver: "oracle"
-    url: "oracle://user:${ORACLE_DB_PASSWORD}@host:1521/service"
-    max_conns: 5
-    max_idle_conns: 1
-    max_conn_lifetime: "30m"
-    max_conn_idle_time: "10m"
-
 queries:
   oracle_active_sessions:
     # db не указан — возьмёт "azdh_oracle" из default_db этого файла

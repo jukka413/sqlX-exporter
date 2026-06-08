@@ -1,15 +1,4 @@
 # default_db применяется только к запросам в этом файле.
-default_db: "main_mssql"
-
-databases:
-  main_mssql:
-    driver: "sqlserver"
-    url: "sqlserver://user:${MSSQL_DB_PASSWORD}@host:1433?database=mydb"
-    max_conns: 10
-    max_idle_conns: 2
-    max_conn_lifetime: "1h"
-    max_conn_idle_time: "30m"
-
 queries:
   mssql_active_connections:
     # db не указан — возьмёт "main_mssql" из default_db этого файла
