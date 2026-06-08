@@ -101,6 +101,13 @@ type QueryConfig struct {
 
 	Labels      map[string]string `yaml:"labels,omitempty"`
 	ValueColumn string            `yaml:"value_column,omitempty"`
+
+	// MetricName — имя метрики в Prometheus.
+	// Заполняется автоматически при загрузке конфига — равно имени запроса.
+	// При клонировании для нескольких БД ключ воркера становится составным
+	// (name+db), но MetricName остаётся оригинальным именем запроса.
+	// Это позволяет иметь одинаковое имя метрики для разных БД без суффиксов.
+	MetricName string `yaml:"-"` // не читается из YAML, проставляется кодом
 }
 
 type ScheduleConfig struct {
@@ -150,6 +157,15 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 
 	expandURLs(&cfg)
 
+	// Проставляем MetricName = имя запроса для каждого запроса.
+	// Это нужно до клонирования — при клонировании ключ изменится но MetricName останется.
+	for name, q := range cfg.Queries {
+		if q.MetricName == "" {
+			q.MetricName = name
+			cfg.Queries[name] = q
+		}
+	}
+
 	// Определяем эффективный default_db для этого файла
 	effectiveDefaultDB := cfg.DefaultDB
 	if effectiveDefaultDB == "" {
@@ -185,7 +201,7 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 						return cfg, fmt.Errorf("include %q (db=%s): %w", fullPath, db, err)
 					}
 					if addSuffix {
-						inc = suffixQueryNames(inc, "_"+db)
+						inc = cloneQueriesForDB(inc, db)
 					}
 					mergeConfig(&cfg, inc)
 				}
@@ -245,16 +261,19 @@ func expandURLs(cfg *Config) {
 	}
 }
 
-// suffixQueryNames возвращает копию конфига где все имена запросов
-// получают указанный суффикс. Используется когда один файл метрик
-// загружается для нескольких БД — суффикс делает имена воркеров уникальными.
-func suffixQueryNames(cfg Config, suffix string) Config {
+// cloneQueriesForDB возвращает копию конфига где ключи запросов становятся
+// составными "name__db" для уникальности воркеров.
+// MetricName при этом сохраняется оригинальным — имя метрики в Prometheus
+// остаётся чистым без суффиксов.
+func cloneQueriesForDB(cfg Config, db string) Config {
 	if len(cfg.Queries) == 0 {
 		return cfg
 	}
 	newQueries := make(map[string]QueryConfig, len(cfg.Queries))
 	for name, q := range cfg.Queries {
-		newQueries[name+suffix] = q
+		// Ключ составной — уникален для каждой БД
+		// MetricName остаётся оригинальным именем запроса
+		newQueries[name+"__"+db] = q
 	}
 	cfg.Queries = newQueries
 	return cfg

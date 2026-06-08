@@ -152,46 +152,51 @@ func runOnce(
 ) (nextPrevLabels []prometheus.Labels) {
 	start := time.Now()
 
+	// metricName — имя метрики в Prometheus.
+	// Для запросов клонированных под несколько БД MetricName содержит
+	// оригинальное имя без суффикса __db, чтобы метрики были чистыми.
+	// name (ключ воркера) может содержать суффикс для уникальности.
+	metricName := queryCfg.MetricName
+	if metricName == "" {
+		metricName = name // фолбэк для обратной совместимости
+	}
+
 	queryCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	var runErr error
 	if queryCfg.ValueColumn != "" {
-		nextPrevLabels, runErr = runMultiRow(queryCtx, logger, name, queryCfg, db, prevLabels)
+		nextPrevLabels, runErr = runMultiRow(queryCtx, logger, metricName, queryCfg, db, prevLabels)
 	} else {
-		runErr = runSingleValue(queryCtx, logger, name, queryCfg, db)
+		runErr = runSingleValue(queryCtx, logger, metricName, queryCfg, db)
 	}
 
 	duration := time.Since(start).Seconds()
-	queryDuration.WithLabelValues(name, queryCfg.DB).Observe(duration)
+	queryDuration.WithLabelValues(metricName, queryCfg.DB).Observe(duration)
 
 	if runErr != nil {
 		reason := classifyError(ctx, queryCtx)
 
 		if reason == "cancelled" {
-			// Запрос отменён следующим тиком — не ошибка, не трогаем метрики
 			logger.Info("query cancelled by next tick", "query", name, "elapsed", duration)
-			return prevLabels // возвращаем старые лейблы без изменений
+			return prevLabels
 		}
 
-		queryErrors.WithLabelValues(name, queryCfg.DB, reason).Inc()
-		queryUp.WithLabelValues(name, queryCfg.DB).Set(0)
+		queryErrors.WithLabelValues(metricName, queryCfg.DB, reason).Inc()
+		queryUp.WithLabelValues(metricName, queryCfg.DB).Set(0)
 		logger.Error("query failed", "query", name, "reason", reason, "error", runErr)
 
-		// При ошибке удаляем все метрики предыдущего запуска —
-		// данные устарели и не должны оставаться на графиках
-		metric, exists := lookupQueryMetric(name)
+		metric, exists := lookupQueryMetric(metricName)
 		if exists {
 			for _, lbl := range prevLabels {
 				metric.Delete(lbl)
 			}
 		}
-		// Возвращаем nil — после ошибки нет "предыдущего успешного набора"
 		return nil
 	}
 
-	queryUp.WithLabelValues(name, queryCfg.DB).Set(1)
-	queryLastSuccess.WithLabelValues(name, queryCfg.DB).SetToCurrentTime()
+	queryUp.WithLabelValues(metricName, queryCfg.DB).Set(1)
+	queryLastSuccess.WithLabelValues(metricName, queryCfg.DB).SetToCurrentTime()
 	logger.Info("query success", "query", name, "duration", duration)
 
 	return nextPrevLabels
