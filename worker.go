@@ -26,9 +26,15 @@ func startQueryWorker(
 ) {
 	defer wg.Done()
 
+	// metricName — чистое имя метрики без суффикса __db для логов
+	metricName := queryCfg.MetricName
+	if metricName == "" {
+		metricName = name
+	}
+
 	timeout, err := time.ParseDuration(queryCfg.Timeout)
 	if err != nil {
-		logger.Error("invalid timeout, worker stopped", "query", name, "error", err)
+		logger.Error("invalid timeout, worker stopped", "query", metricName, "db", queryCfg.DB, "error", err)
 		return
 	}
 
@@ -39,11 +45,11 @@ func startQueryWorker(
 	if queryCfg.Schedule != nil {
 		loc, entries, err := parseSchedule(queryCfg.Schedule)
 		if err != nil {
-			logger.Error("invalid schedule, worker stopped", "query", name, "error", err)
+			logger.Error("invalid schedule, worker stopped", "query", metricName, "db", queryCfg.DB, "error", err)
 			return
 		}
 
-		logger.Info("started scheduled query worker", "query", name)
+		logger.Info("started scheduled query worker", "query", metricName, "db", queryCfg.DB)
 
 		for {
 			nr := nextRun(time.Now(), loc, entries)
@@ -51,7 +57,7 @@ func startQueryWorker(
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				logger.Info("stopping query worker", "query", name)
+				logger.Info("stopping query worker", "query", metricName, "db", queryCfg.DB)
 				return
 			case <-timer.C:
 				runner.run(queryCfg, db, timeout)
@@ -62,19 +68,19 @@ func startQueryWorker(
 	// --- Interval mode ---
 	interval, err := time.ParseDuration(queryCfg.Interval)
 	if err != nil {
-		logger.Error("invalid interval, worker stopped", "query", name, "error", err)
+		logger.Error("invalid interval, worker stopped", "query", metricName, "db", queryCfg.DB, "error", err)
 		return
 	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	logger.Info("started interval query worker", "query", name)
+	logger.Info("started interval query worker", "query", metricName, "db", queryCfg.DB)
 
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("stopping query worker", "query", name)
+			logger.Info("stopping query worker", "query", metricName, "db", queryCfg.DB)
 			return
 		case <-ticker.C:
 			runner.run(queryCfg, db, timeout)
@@ -178,13 +184,13 @@ func runOnce(
 		reason := classifyError(ctx, queryCtx)
 
 		if reason == "cancelled" {
-			logger.Info("query cancelled by next tick", "query", name, "elapsed", duration)
+			logger.Info("query cancelled by next tick", "query", metricName, "db", queryCfg.DB, "elapsed", duration)
 			return prevLabels
 		}
 
 		queryErrors.WithLabelValues(metricName, queryCfg.DB, reason).Inc()
 		queryUp.WithLabelValues(metricName, queryCfg.DB).Set(0)
-		logger.Error("query failed", "query", name, "reason", reason, "error", runErr)
+		logger.Error("query failed", "query", metricName, "db", queryCfg.DB, "reason", reason, "error", runErr)
 
 		metric, exists := lookupQueryMetric(metricName)
 		if exists {
@@ -197,7 +203,7 @@ func runOnce(
 
 	queryUp.WithLabelValues(metricName, queryCfg.DB).Set(1)
 	queryLastSuccess.WithLabelValues(metricName, queryCfg.DB).SetToCurrentTime()
-	logger.Info("query success", "query", name, "duration", duration)
+	logger.Info("query success", "query", metricName, "db", queryCfg.DB, "duration", duration)
 
 	return nextPrevLabels
 }
@@ -243,14 +249,14 @@ func runSingleValue(
 
 	value, ok := toFloat64(result)
 	if !ok {
-		logger.Error("query result is not numeric", "query", name)
+		logger.Error("query result is not numeric", "query", name, "db", queryCfg.DB)
 		return nil
 	}
 
 	metric := getOrCreateQueryMetric(name, queryCfg.Labels, nil)
 	metric.With(buildLabelValues(queryCfg.DB, queryCfg.Labels, nil)).Set(value)
 
-	logger.Info("query value", "query", name, "value", value)
+	logger.Info("query value", "query", name, "db", queryCfg.DB, "value", value)
 	return nil
 }
 
@@ -329,6 +335,7 @@ func runMultiRow(
 		if !ok {
 			logger.Warn("skipping row: value column is not numeric",
 				"query", name,
+				"db", queryCfg.DB,
 				"value_column", queryCfg.ValueColumn,
 				"raw", scanBuf[valueColIdx],
 			)
@@ -352,7 +359,7 @@ func runMultiRow(
 	}
 
 	if len(currentLabels) == 0 {
-		logger.Warn("query returned 0 rows", "query", name)
+		logger.Warn("query returned 0 rows", "query", name, "db", queryCfg.DB)
 	}
 
 	// Reconciliation: удаляем строки которые были в прошлом запуске но исчезли сейчас.
@@ -364,7 +371,7 @@ func runMultiRow(
 	for _, lbl := range prevLabels {
 		if _, exists := currentSet[labelsKey(lbl)]; !exists {
 			metric.Delete(lbl)
-			logger.Info("removed stale metric row", "query", name, "labels", lbl)
+			logger.Info("removed stale metric row", "query", name, "db", queryCfg.DB, "labels", lbl)
 		}
 	}
 
