@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -34,8 +35,19 @@ type Config struct {
 	//       - "ir_test_oracle"
 	IncludeDefaults map[string]IncludeDefault `yaml:"include_defaults,omitempty"`
 
-	// Includes — список путей к дополнительным конфиг файлам.
-	Includes []string `yaml:"includes,omitempty"`
+	// Includes — карта путей к дополнительным конфиг файлам.
+	// Ключ — произвольное имя (для удобства в values файлах), значение — true.
+	// Map вместо списка специально: при мерже нескольких Helm values файлов
+	// Helm делает глубокий мерж map-полей, но ПОЛНОСТЬЮ заменяет списки.
+	// Со списком второй values файл стирал includes первого; с map — оба
+	// набора ключей объединяются автоматически.
+	//
+	// Пример в values:
+	//   config:
+	//     includes:
+	//       "oracle.yaml": true
+	//       "mssql.yaml": true
+	Includes map[string]bool `yaml:"includes,omitempty"`
 
 	Databases map[string]DBConfig    `yaml:"databases"`
 	Queries   map[string]QueryConfig `yaml:"queries"`
@@ -182,10 +194,19 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 	// (текущий имеет приоритет)
 	effectiveIncludeDefaults := mergeIncludeDefaults(parentIncludeDefaults, cfg.IncludeDefaults)
 
-	// Обрабатываем инклюды
+	// Обрабатываем инклюды.
+	// Сортируем ключи для детерминированного порядка обработки —
+	// порядок итерации по map в Go не гарантирован, а порядок важен
+	// для приоритета при mergeConfig (последний обработанный — побеждает).
 	if len(cfg.Includes) > 0 {
 		baseDir := filepath.Dir(path)
-		for _, includePath := range cfg.Includes {
+		includePaths := make([]string, 0, len(cfg.Includes))
+		for p := range cfg.Includes {
+			includePaths = append(includePaths, p)
+		}
+		sort.Strings(includePaths)
+
+		for _, includePath := range includePaths {
 			fullPath := filepath.Join(baseDir, includePath)
 			baseName := filepath.Base(includePath)
 

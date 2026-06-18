@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gopkg.in/yaml.v3"
 )
 
 func main() {
@@ -86,17 +87,30 @@ func main() {
 	logger.Info("application stopped gracefully")
 }
 
-// collectIncludeDirs читает конфиг и возвращает директории всех инклюд-файлов.
-// Используется при старте чтобы настроить watcher на все нужные директории.
+// collectIncludeDirs читает конфиг и возвращает директории всех инклюд-файлов
+// для настройки watcher. Читает файл напрямую (не через loadConfig), потому что
+// loadConfig очищает cfg.Includes после обработки инклюдов — этот срез
+// был бы уже пустым на момент возврата.
+//
+// Примечание: собирает только инклюды основного файла, не рекурсивные
+// инклюды внутри инклюдов. На практике все файлы обычно лежат в одной
+// директории ConfigMap, так что этого достаточно.
 func collectIncludeDirs(configPath string) []string {
-	cfg, err := loadConfig(configPath)
-	if err != nil || len(cfg.Includes) == 0 {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil
+	}
+	if len(cfg.Includes) == 0 {
 		return nil
 	}
 	baseDir := filepath.Dir(configPath)
 	seen := map[string]struct{}{}
 	var dirs []string
-	for _, inc := range cfg.Includes {
+	for inc := range cfg.Includes {
 		dir := filepath.Dir(filepath.Join(baseDir, inc))
 		if _, ok := seen[dir]; !ok {
 			seen[dir] = struct{}{}

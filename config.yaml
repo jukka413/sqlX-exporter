@@ -12,10 +12,10 @@ include_defaults:
   pg-metrics.yaml: "main"
 
 includes:
-  - "oracle-metrics.yaml"
-  - "mssql-metrics.yaml"
-  - "pg-metrics.yaml"
-  -
+  "oracle-metrics.yaml": true
+  "mssql-metrics.yaml": true
+  "pg-metrics.yaml": true
+
 databases:
   main:
     driver: "pgx"
