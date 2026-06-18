@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -247,7 +248,14 @@ func applyDefaultDB(cfg *Config, defaultDB string) {
 }
 
 // expandURLs подставляет переменные окружения только в поля url баз данных.
-// Значения URL-кодируются чтобы спецсимволы в паролях не ломали парсинг URL.
+//
+// Значения по умолчанию URL-кодируются чтобы спецсимволы в паролях
+// (@ / + # % & : пробел и др.) не ломали парсинг URL.
+//
+// Исключение — значения похожие на TNS-дескриптор Oracle:
+// "(DESCRIPTION=(ADDRESS=...)...)" — такие значения НЕ кодируются,
+// иначе скобки и = превратятся в %28 %29 %3D и resolveDSN не сможет
+// распознать и распарсить TNS-дескриптор в db.go.
 func expandURLs(cfg *Config) {
 	for name, db := range cfg.Databases {
 		db.URL = os.Expand(db.URL, func(key string) string {
@@ -255,10 +263,25 @@ func expandURLs(cfg *Config) {
 			if val == "" {
 				return ""
 			}
+			if looksLikeTNSDescriptor(val) {
+				return val // подставляем как есть, без кодирования
+			}
 			return url.PathEscape(val)
 		})
 		cfg.Databases[name] = db
 	}
+}
+
+// looksLikeTNSDescriptor определяет похоже ли значение на TNS-дескриптор Oracle.
+// Признак: начинается с "(" и содержит "DESCRIPTION=" или "ADDRESS=" —
+// этого достаточно чтобы отличить TNS от обычного пароля.
+func looksLikeTNSDescriptor(val string) bool {
+	trimmed := strings.TrimSpace(val)
+	if !strings.HasPrefix(trimmed, "(") {
+		return false
+	}
+	upper := strings.ToUpper(trimmed)
+	return strings.Contains(upper, "DESCRIPTION=") || strings.Contains(upper, "ADDRESS=")
 }
 
 // cloneQueriesForDB возвращает копию конфига где ключи запросов становятся
