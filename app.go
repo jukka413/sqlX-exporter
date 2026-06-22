@@ -49,6 +49,9 @@ type app struct {
 	// reconnectInterval — текущий интервал переподключения к упавшим БД.
 	// Обновляется при reload если значение в конфиге изменилось.
 	reconnectInterval time.Duration
+
+	// defaultDB — имя БД по умолчанию для запросов без явного поля db.
+	defaultDB string
 }
 
 // =========================================================================
@@ -161,9 +164,28 @@ func (a *app) reload() {
 		return
 	}
 
-	if err := validateConfigDurations(newCfg); err != nil {
+	// Логируем инклюды которые были пропущены из-за отсутствия
+	// записи в include_defaults — это осознанное поведение, но должно
+	// быть видно в логах а не тихо проигнорировано.
+	for _, reason := range newCfg.skippedIncludes {
+		a.logger.Info("include skipped (no include_defaults entry)", "detail", reason)
+	}
+
+	// Критичные проверки — структурные ошибки конфига (драйверы, URL,
+	// durations баз данных). Ошибка здесь означает что конфиг сломан
+	// целиком, поэтому reload прерывается полностью.
+	if err := validateDatabasesAndSettings(newCfg); err != nil {
 		a.logger.Error("invalid config", "error", err)
 		return
+	}
+
+	// Мягкая валидация запросов — каждый запрос проверяется независимо.
+	// Невалидные запросы (например без db и без default_db) удаляются
+	// из конфига с логированием, но остальные запросы продолжают работать.
+	if removed := sanitizeQueries(&newCfg); len(removed) > 0 {
+		for _, reason := range removed {
+			a.logger.Error("skipping invalid query", "reason", reason)
+		}
 	}
 
 	newPools, toClose, newFailed := a.buildPools(newCfg.Databases)
@@ -186,6 +208,7 @@ func (a *app) reload() {
 	a.queriesCfg = newCfg.Queries
 	// Обновляем интервал переподключения — poolHealthChecker подхватит при следующем тике
 	a.reconnectInterval = newCfg.Settings.DBReconnectIntervalDuration()
+	a.defaultDB = newCfg.Settings.DefaultDB
 	a.mu.Unlock()
 
 	for name, p := range toClose {
@@ -303,6 +326,15 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 	a.mu.Unlock()
 
 	for name, q := range queries {
+		// Подставляем БД по умолчанию если в запросе не указана явная БД
+		if q.DB == "" {
+			if a.defaultDB == "" {
+				a.logger.Error("query has no db and no default_db is set", "query", name)
+				continue
+			}
+			q.DB = a.defaultDB
+		}
+
 		pEntry, ok := currentPools[q.DB]
 		if !ok || pEntry == nil || pEntry.db == nil {
 			a.logger.Error("db not available for query", "query", name, "db", q.DB)

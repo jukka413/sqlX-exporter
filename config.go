@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -51,6 +50,11 @@ type Config struct {
 
 	Databases map[string]DBConfig    `yaml:"databases"`
 	Queries   map[string]QueryConfig `yaml:"queries"`
+
+	// skippedIncludes — список файлов из includes которые были проигнорированы
+	// потому что для них не нашлось записи в include_defaults.
+	// Не из YAML — заполняется кодом при загрузке, для логирования в app.go.
+	skippedIncludes []string `yaml:"-"`
 }
 
 // IncludeDefault поддерживает как строку так и список строк в YAML:
@@ -210,30 +214,34 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 			fullPath := filepath.Join(baseDir, includePath)
 			baseName := filepath.Base(includePath)
 
-			// Проверяем есть ли для этого файла маппинг в include_defaults
-			if dbs, ok := effectiveIncludeDefaults[baseName]; ok {
-				// Загружаем файл для каждой БД и мержим.
-				// Если БД несколько — все запросы получают суффикс _dbname
-				// чтобы воркеры были уникальны. Лейбл db в метрике всё равно
-				// различает их в Prometheus.
-				addSuffix := len(dbs) > 1
-				for _, db := range dbs {
-					inc, err := loadConfigWithContext(fullPath, depth+1, db, effectiveIncludeDefaults)
-					if err != nil {
-						return cfg, fmt.Errorf("include %q (db=%s): %w", fullPath, db, err)
-					}
-					if addSuffix {
-						inc = cloneQueriesForDB(inc, db)
-					}
-					mergeConfig(&cfg, inc)
-				}
-			} else {
-				// Нет маппинга — загружаем как обычно
-				inc, err := loadConfigWithContext(fullPath, depth+1, effectiveDefaultDB, effectiveIncludeDefaults)
+			// Файл загружается ТОЛЬКО если для него есть запись в include_defaults.
+			// Без записи — файл осознанно игнорируется (см. skippedIncludes ниже).
+			// Это позволяет держать файлы метрик переиспользуемыми: добавление
+			// файла в includes без include_defaults безопасно ничего не делает,
+			// а не падает с ошибкой "db is required".
+			dbs, ok := effectiveIncludeDefaults[baseName]
+			if !ok {
+				cfg.skippedIncludes = append(cfg.skippedIncludes,
+					fmt.Sprintf("%q: no entry in include_defaults", includePath))
+				continue
+			}
+
+			// Загружаем файл для каждой БД и мержим.
+			// Если БД несколько — все запросы получают суффикс _dbname
+			// чтобы воркеры были уникальны. Лейбл db в метрике всё равно
+			// различает их в Prometheus.
+			addSuffix := len(dbs) > 1
+			for _, db := range dbs {
+				inc, err := loadConfigWithContext(fullPath, depth+1, db, effectiveIncludeDefaults)
 				if err != nil {
-					return cfg, fmt.Errorf("include %q: %w", fullPath, err)
+					return cfg, fmt.Errorf("include %q (db=%s): %w", fullPath, db, err)
+				}
+				if addSuffix {
+					inc = cloneQueriesForDB(inc, db)
 				}
 				mergeConfig(&cfg, inc)
+				// Переносим skippedIncludes из дочернего конфига наверх
+				cfg.skippedIncludes = append(cfg.skippedIncludes, inc.skippedIncludes...)
 			}
 		}
 		cfg.Includes = nil
@@ -348,7 +356,56 @@ func mergeConfig(dst *Config, src Config) {
 	}
 }
 
-func validateConfigDurations(cfg Config) error {
+// sanitizeQueries проверяет каждый запрос независимо и удаляет невалидные
+// из cfg.Queries вместо того чтобы валить весь конфиг одной ошибкой.
+// Возвращает список причин по которым запросы были удалены — для логирования.
+//
+// Критичные проверки (драйверы, URL, durations баз данных) остаются
+// в validateDatabasesAndSettings и продолжают валить весь reload — они означают
+// что конфиг структурно сломан, а не что у одного запроса опечатка.
+func sanitizeQueries(cfg *Config) []string {
+	var removed []string
+
+	for name, q := range cfg.Queries {
+		if reason := validateSingleQuery(cfg, name, q); reason != "" {
+			removed = append(removed, fmt.Sprintf("query %q skipped: %s", name, reason))
+			delete(cfg.Queries, name)
+		}
+	}
+
+	return removed
+}
+
+// validateSingleQuery проверяет один запрос и возвращает причину невалидности
+// (пустая строка — запрос валиден).
+func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
+	if q.DB == "" && cfg.Settings.DefaultDB == "" {
+		return "db is required (or set default_db / settings.default_db)"
+	}
+	if q.DB != "" {
+		if _, ok := cfg.Databases[q.DB]; !ok {
+			return fmt.Sprintf("db %q is not defined in databases", q.DB)
+		}
+	}
+	if _, err := time.ParseDuration(q.Timeout); err != nil {
+		return fmt.Sprintf("invalid timeout: %v", err)
+	}
+	if q.Schedule != nil {
+		if err := validateSchedule(q.Schedule); err != nil {
+			return fmt.Sprintf("invalid schedule: %v", err)
+		}
+	} else {
+		if _, err := time.ParseDuration(q.Interval); err != nil {
+			return fmt.Sprintf("invalid interval: %v", err)
+		}
+	}
+	return ""
+}
+
+// validateDatabasesAndSettings проверяет критичные части конфига —
+// настройки и описания БД. Ошибки здесь валят весь reload, так как
+// означают структурно сломанный конфиг (а не опечатку в одном запросе).
+func validateDatabasesAndSettings(cfg Config) error {
 	if cfg.Settings.DBReconnectInterval != "" {
 		if _, err := time.ParseDuration(cfg.Settings.DBReconnectInterval); err != nil {
 			return fmt.Errorf("settings.db_reconnect_interval is invalid: %w", err)
@@ -384,29 +441,6 @@ func validateConfigDurations(cfg Config) error {
 		if db.HealthCheckPeriod != "" {
 			if _, err := time.ParseDuration(db.HealthCheckPeriod); err != nil {
 				return fmt.Errorf("database %q has invalid health_check_period: %w", name, err)
-			}
-		}
-	}
-
-	for name, q := range cfg.Queries {
-		if q.DB == "" && cfg.Settings.DefaultDB == "" {
-			return fmt.Errorf("query %q: db is required (or set default_db / settings.default_db)", name)
-		}
-		if q.DB != "" {
-			if _, ok := cfg.Databases[q.DB]; !ok {
-				return fmt.Errorf("query %q: db %q is not defined in databases", name, q.DB)
-			}
-		}
-		if _, err := time.ParseDuration(q.Timeout); err != nil {
-			return errors.New("query " + name + " has invalid timeout: " + err.Error())
-		}
-		if q.Schedule != nil {
-			if err := validateSchedule(q.Schedule); err != nil {
-				return fmt.Errorf("query %q has invalid schedule: %w", name, err)
-			}
-		} else {
-			if _, err := time.ParseDuration(q.Interval); err != nil {
-				return fmt.Errorf("query %q has invalid interval: %w", name, err)
 			}
 		}
 	}
