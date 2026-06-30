@@ -170,7 +170,33 @@ func buildTNSDSN(rawURL, prefix string) (string, error) {
 	// пробелы внутри TNS дескриптора
 	tns = strings.Join(strings.Fields(tns), "")
 
-	user, password, _ := strings.Cut(credentials, ":")
+	rawUser, rawPassword, _ := strings.Cut(credentials, ":")
+
+	// ВАЖНО (исправленный баг): expandURLs в config.go кодирует значения
+	// переменных через url.QueryEscape перед подстановкой в URL — например
+	// пароль "my$pass!word" становится "my%24pass%21word" в строке URL.
+	// Для обычного oracle:// пути (см. buildOracleDSN) это безопасно,
+	// потому что url.Parse автоматически РАСКОДИРУЕТ userinfo при парсинге —
+	// u.User.Password() возвращает уже чистое "my$pass!word".
+	//
+	// Но этот TNS-путь использует простой strings.Cut вместо net/url.Parse —
+	// никакого раскодирования здесь не происходило. В результате go_ora
+	// получал буквально "my%24pass%21word" как пароль вместо "my$pass!word",
+	// и Oracle совершенно ожидаемо отвечал ORA-01017 invalid username/password —
+	// причём именно для паролей содержащих символы которые url.QueryEscape
+	// реально кодирует (как раз $ и ! среди них, хотя RFC 3986 формально
+	// не требует их кодировать в userinfo — Go их всё равно кодирует).
+	// Пароли без спецсимволов проходили нормально, потому что QueryEscape
+	// их не трогает — отсюда воспроизводимость "ломается только если есть
+	// спецсимволы".
+	user, err := url.QueryUnescape(rawUser)
+	if err != nil {
+		return "", fmt.Errorf("oracle+tns:// invalid encoding in username: %w", err)
+	}
+	password, err := url.QueryUnescape(rawPassword)
+	if err != nil {
+		return "", fmt.Errorf("oracle+tns:// invalid encoding in password: %w", err)
+	}
 
 	urlOptions := map[string]string{
 		"client charset": "UTF8",
