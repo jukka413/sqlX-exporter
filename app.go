@@ -51,7 +51,24 @@ type app struct {
 	reconnectInterval time.Duration
 
 	// defaultDB — имя БД по умолчанию для запросов без явного поля db.
+	// Защищается тем же mu — читать напрямую без лока (как было раньше
+	// в reconcileWorkers) это data race с записью в reload().
 	defaultDB string
+
+	// reconcileMu гарантирует что reconcileWorkers не выполняется параллельно
+	// сам с собой. Вызывается из двух независимых горутин — reload() (по сигналу
+	// watcher) и poolHealthChecker() (по таймеру) — без этого лока возможен сценарий:
+	// обе горутины одновременно видят отсутствие воркера для одного query name,
+	// обе стартуют свой воркер, один из них теряется без cancel — утечка горутины
+	// и дублирующиеся запросы к БД для одной и той же метрики.
+	reconcileMu sync.Mutex
+}
+
+// getDefaultDB безопасно читает defaultDB под локом.
+func (a *app) getDefaultDB() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.defaultDB
 }
 
 // =========================================================================
@@ -314,6 +331,11 @@ func (a *app) createAndPingPool(name string, dbCfg DBConfig) (*sql.DB, bool) {
 // =========================================================================
 
 func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
+	// Без этого лока reload() и poolHealthChecker() могут вызвать
+	// reconcileWorkers параллельно — см. комментарий у reconcileMu в типе app.
+	a.reconcileMu.Lock()
+	defer a.reconcileMu.Unlock()
+
 	a.mu.Lock()
 	currentWorkers := make(map[string]*worker, len(a.workers))
 	for k, v := range a.workers {
@@ -325,14 +347,16 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 	}
 	a.mu.Unlock()
 
+	defaultDB := a.getDefaultDB()
+
 	for name, q := range queries {
 		// Подставляем БД по умолчанию если в запросе не указана явная БД
 		if q.DB == "" {
-			if a.defaultDB == "" {
+			if defaultDB == "" {
 				a.logger.Error("query has no db and no default_db is set", "query", name)
 				continue
 			}
-			q.DB = a.defaultDB
+			q.DB = defaultDB
 		}
 
 		pEntry, ok := currentPools[q.DB]
@@ -381,9 +405,33 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 			a.logger.Info("stopping removed query", "query", name)
 			w.cancel()
 			wg := w.wg
+			metricName := w.cfg.MetricName
 			delete(a.workers, name)
+
+			// Проверяем не использует ли ЕЩЁ ЖИВОЙ воркер тот же MetricName.
+			// Это случай cloneQueriesForDB: один файл метрик подключён для
+			// нескольких БД (include_defaults с списком), и у обоих воркеров
+			// одинаковый MetricName, но разные ключи (name__db1, name__db2).
+			// Если убрать только одну БД из include_defaults — нельзя снести
+			// метрику целиком, потому что воркер для второй БД продолжает
+			// в неё писать.
+			sharedByOthers := false
+			for otherName, otherW := range a.workers {
+				if otherName != name && otherW.cfg.MetricName == metricName {
+					sharedByOthers = true
+					break
+				}
+			}
+
 			a.mu.Unlock()
 			wg.Wait()
+			// Метрика убирается из Prometheus registry только после того как
+			// воркер гарантированно остановлен (wg.Wait() выше) — иначе можно
+			// поймать гонку: воркер ещё успевает сделать metric.With(...).Set()
+			// на уже отозванный коллектор между Unregister и завершением горутины.
+			if metricName != "" && !sharedByOthers {
+				unregisterQueryMetric(metricName)
+			}
 			a.mu.Lock()
 		}
 	}

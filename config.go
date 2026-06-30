@@ -139,9 +139,19 @@ type ScheduleAt struct {
 
 // loadConfig загружает конфиг из файла path и рекурсивно обрабатывает includes.
 func loadConfig(path string) (Config, error) {
-	// Предварительное чтение для получения глобального default_db
+	// Предварительное чтение для получения глобального default_db и include_defaults
+	// до того как они нужны дочерним инклюдам. Ошибки здесь намеренно не считаются
+	// фатальными на этом шаге — тот же файл будет прочитан и провалидирован
+	// по-настоящему внутри loadConfigWithContext, и там ошибка корректно вернётся
+	// наружу. Если этот шаг тихо не сработал (плохой YAML, нет файла) —
+	// globalDefault/IncludeDefaults останутся пустыми, что эквивалентно их отсутствию
+	// в конфиге, и не маскирует реальную ошибку — она всплывёт чуть ниже.
 	var preview Config
-	if data, err := os.ReadFile(path); err == nil {
+	data, err := os.ReadFile(path)
+	if err == nil {
+		// Ошибку Unmarshal здесь сознательно не пробрасываем — невалидный YAML
+		// будет повторно обработан (и вернёт понятную ошибку с точным местом)
+		// внутри loadConfigWithContext на той же строке кода.
 		_ = yaml.Unmarshal(data, &preview)
 	}
 	globalDefault := preview.DefaultDB
@@ -333,6 +343,16 @@ func cloneQueriesForDB(cfg Config, db string) Config {
 
 // mergeConfig мержит src в dst.
 // src (инклюд) имеет приоритет — перезаписывает существующие ключи.
+//
+// ВНИМАНИЕ (известный риск, не исправлено): если два разных инклюд-файла
+// (например из разных Git-репозиториев в multi-source ArgoCD) случайно
+// объявляют запрос с одинаковым именем — один тихо перезапишет другой
+// без какого-либо предупреждения, потому что mergeConfig не имеет доступа
+// к логгеру и не сравнивает старое/новое значение перед записью.
+// Симптом в проде: метрика которая должна обновляться от одной БД,
+// внезапно начинает работать с другой, без единой строки в логах.
+// TODO: либо протащить logger через loadConfigWithContext → mergeConfig,
+// либо возвращать []string с предупреждениями как делает sanitizeQueries.
 func mergeConfig(dst *Config, src Config) {
 	if src.Settings.DBReconnectInterval != "" {
 		dst.Settings.DBReconnectInterval = src.Settings.DBReconnectInterval

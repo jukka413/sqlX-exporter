@@ -197,3 +197,26 @@ func lookupQueryMetric(queryName string) (*prometheus.GaugeVec, bool) {
 	m, ok := queryResultMetrics[queryName]
 	return m, ok
 }
+
+// unregisterQueryMetric полностью убирает метрику из Prometheus registry и
+// из внутренней map queryResultMetrics.
+//
+// Без этого вызова удаление запроса из конфига (через hot-reload или
+// sanitizeQueries) останавливает воркер, но саму метрику оставляет навечно
+// зарегистрированной в Prometheus с последним известным значением —
+// time series просто замораживается и никогда не пропадает с /metrics.
+// При частых hot-reload (несколько values файлов в одном проекте, частые
+// изменения списка запросов) это постепенно копит мёртвые метрики.
+//
+// Вызывается из reconcileWorkers в момент когда запрос пропал из конфига.
+func unregisterQueryMetric(queryName string) {
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
+
+	m, ok := queryResultMetrics[queryName]
+	if !ok {
+		return
+	}
+	prometheus.Unregister(m)
+	delete(queryResultMetrics, queryName)
+}
