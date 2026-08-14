@@ -18,6 +18,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "./config.yaml", "path to config file")
+	listenAddr := flag.String("listen-address", ":2112", "address for the metrics HTTP server to listen on")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -41,9 +42,12 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	metricsSrv := &http.Server{
-		Addr:              ":2112",
+		Addr:              *listenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MiB
 	}
 	go func() {
 		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -110,7 +114,10 @@ func collectIncludeDirs(configPath string) []string {
 	baseDir := filepath.Dir(configPath)
 	seen := map[string]struct{}{}
 	var dirs []string
-	for inc := range cfg.Includes {
+	for inc, enabled := range cfg.Includes {
+		if !enabled {
+			continue
+		}
 		dir := filepath.Dir(filepath.Join(baseDir, inc))
 		if _, ok := seen[dir]; !ok {
 			seen[dir] = struct{}{}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"time"
@@ -14,14 +15,14 @@ import (
 // openAndPingDB открывает соединение с БД и проверяет его через Ping.
 // Для Oracle использует go_ora.BuildUrl который правильно кодирует
 // параметры с пробелами (client charset).
-func openAndPingDB(ctx context.Context, cfg DBConfig) (*sql.DB, error) {
+func openAndPingDB(ctx context.Context, cfg DBConfig, logger *slog.Logger) (*sql.DB, error) {
 	var (
 		db  *sql.DB
 		err error
 	)
 
 	if strings.EqualFold(strings.TrimSpace(cfg.Driver), "oracle") {
-		db, err = openOracleDB(cfg)
+		db, err = openOracleDB(cfg, logger)
 	} else {
 		db, err = sql.Open(cfg.Driver, cfg.URL)
 	}
@@ -71,7 +72,7 @@ func openAndPingDB(ctx context.Context, cfg DBConfig) (*sql.DB, error) {
 //	oracle://user:pass@host:port/service
 //	oracle+tns://user:pass@(DESCRIPTION=...)
 //	oracle+tns://user:pass@/?CONNSTR=(DESCRIPTION=...)
-func openOracleDB(cfg DBConfig) (*sql.DB, error) {
+func openOracleDB(cfg DBConfig, logger *slog.Logger) (*sql.DB, error) {
 	connStr, err := buildOracleDSN(cfg.URL)
 	if err != nil {
 		return nil, err
@@ -84,10 +85,12 @@ func openOracleDB(cfg DBConfig) (*sql.DB, error) {
 
 	// Устанавливаем язык сообщений на английский чтобы избежать проблем
 	// с кодировкой кириллицы в текстах ошибок Oracle.
-	// Это работает даже без NLS_LANG в окружении.
+	// Не фатально если не удалось — подключение продолжает работать,
+	// просто сообщения об ошибках могут прийти не на английском.
 	if err := go_ora.AddSessionParam(db, "nls_language", "AMERICAN"); err != nil {
-		// Не фатально — продолжаем без NLS настройки
-		_ = err
+		if logger != nil {
+			logger.Warn("failed to set nls_language session param", "error", err)
+		}
 	}
 
 	return db, nil

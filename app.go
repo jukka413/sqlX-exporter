@@ -15,6 +15,7 @@ type worker struct {
 	cancel     context.CancelFunc
 	wg         *sync.WaitGroup
 	cfg        QueryConfig
+	pool       *dbPool // пул к которому привязан воркер — см. комментарий в reconcileWorkers
 	prevLabels *[]prometheus.Labels
 }
 
@@ -51,8 +52,7 @@ type app struct {
 	reconnectInterval time.Duration
 
 	// defaultDB — имя БД по умолчанию для запросов без явного поля db.
-	// Защищается тем же mu — читать напрямую без лока (как было раньше
-	// в reconcileWorkers) это data race с записью в reload().
+	// Защищается тем же mu — читать напрямую без лока это data race с записью в reload().
 	defaultDB string
 
 	// reconcileMu гарантирует что reconcileWorkers не выполняется параллельно
@@ -62,6 +62,14 @@ type app struct {
 	// обе стартуют свой воркер, один из них теряется без cancel — утечка горутины
 	// и дублирующиеся запросы к БД для одной и той же метрики.
 	reconcileMu sync.Mutex
+
+	// reloadMu гарантирует что reload() не выполняется параллельно сам с собой.
+	// Без этого лока watcher debounce мог бы вызвать reload() ещё раз пока
+	// предыдущий вызов (open/ping нескольких БД, до 5с на каждую) ещё не завершился —
+	// два конкурентных reload() читают один и тот же a.pools как "текущий",
+	// оба создают новые пулы, один из результатов теряется без Close(): утечка
+	// соединения которая никогда не попадёт в toClose ни одного из двух вызовов.
+	reloadMu sync.Mutex
 }
 
 // getDefaultDB безопасно читает defaultDB под локом.
@@ -124,7 +132,6 @@ func (a *app) poolHealthChecker() {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
-			// Проверяем не изменился ли интервал после reload
 			a.mu.Lock()
 			newPeriod := a.reconnectInterval
 			failed := make(map[string]DBConfig, len(a.failedPools))
@@ -137,7 +144,6 @@ func (a *app) poolHealthChecker() {
 			}
 			a.mu.Unlock()
 
-			// Пересоздаём тикер если интервал изменился в конфиге
 			if newPeriod != period {
 				ticker.Reset(newPeriod)
 				period = newPeriod
@@ -173,6 +179,10 @@ func (a *app) poolHealthChecker() {
 // =========================================================================
 
 func (a *app) reload() {
+	// Сериализуем reload() сам с собой — см. комментарий у reloadMu в типе app.
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
+
 	a.logger.Info("reloading configuration")
 
 	newCfg, err := loadConfig(a.configPath)
@@ -181,24 +191,23 @@ func (a *app) reload() {
 		return
 	}
 
-	// Логируем инклюды которые были пропущены из-за отсутствия
-	// записи в include_defaults — это осознанное поведение, но должно
-	// быть видно в логах а не тихо проигнорировано.
 	for _, reason := range newCfg.skippedIncludes {
 		a.logger.Info("include skipped (no include_defaults entry)", "detail", reason)
 	}
+	for _, reason := range newCfg.missingEnvVars {
+		a.logger.Error("environment variable not set, substituted as empty string", "detail", reason)
+	}
+	// Коллизии имён database/query между инклюдами — не фатально, но должно
+	// быть видно: метрика могла молча начать собирать данные с другой БД.
+	for _, reason := range newCfg.overwritten {
+		a.logger.Warn("config key overwritten by a later include", "detail", reason)
+	}
 
-	// Критичные проверки — структурные ошибки конфига (драйверы, URL,
-	// durations баз данных). Ошибка здесь означает что конфиг сломан
-	// целиком, поэтому reload прерывается полностью.
 	if err := validateDatabasesAndSettings(newCfg); err != nil {
 		a.logger.Error("invalid config", "error", err)
 		return
 	}
 
-	// Мягкая валидация запросов — каждый запрос проверяется независимо.
-	// Невалидные запросы (например без db и без default_db) удаляются
-	// из конфига с логированием, но остальные запросы продолжают работать.
 	if removed := sanitizeQueries(&newCfg); len(removed) > 0 {
 		for _, reason := range removed {
 			a.logger.Error("skipping invalid query", "reason", reason)
@@ -207,12 +216,34 @@ func (a *app) reload() {
 
 	newPools, toClose, newFailed := a.buildPools(newCfg.Databases)
 
+	// БД, которых больше нет в конфиге вообще (не изменились, а именно удалены),
+	// buildPools никогда не видит — его аргумент это только новый набор БД.
+	// Без этого шага такие пулы оставались бы в a.pools вечно: соединение не
+	// закрывается, pool-метрики продолжают публиковаться для удалённой БД.
+	a.mu.Lock()
+	var removedDBs []string
+	for name, p := range a.pools {
+		if _, stillInCfg := newCfg.Databases[name]; !stillInCfg {
+			removedDBs = append(removedDBs, name)
+			if p != nil && p.db != nil {
+				toClose[name] = p
+			}
+		}
+	}
+	for _, name := range removedDBs {
+		delete(a.pools, name)
+	}
+	a.mu.Unlock()
+
 	a.mu.Lock()
 	for name, p := range newPools {
 		a.pools[name] = p
+		// Успешно подключились — эта БД больше не "failed", даже если была
+		// в failedPools с прошлого reload. Без этой строки poolHealthChecker
+		// продолжал бы переподключаться к уже живой БД и мог перезаписать
+		// a.pools[name] вторым, лишним соединением.
+		delete(a.failedPools, name)
 	}
-	// Обновляем failedPools: добавляем новые упавшие,
-	// убираем те которых больше нет в конфиге
 	for name, cfg := range newFailed {
 		a.failedPools[name] = cfg
 	}
@@ -221,9 +252,7 @@ func (a *app) reload() {
 			delete(a.failedPools, name)
 		}
 	}
-	// Сохраняем актуальный конфиг запросов для poolHealthChecker
 	a.queriesCfg = newCfg.Queries
-	// Обновляем интервал переподключения — poolHealthChecker подхватит при следующем тике
 	a.reconnectInterval = newCfg.Settings.DBReconnectIntervalDuration()
 	a.defaultDB = newCfg.Settings.DefaultDB
 	a.mu.Unlock()
@@ -235,9 +264,17 @@ func (a *app) reload() {
 		}
 	}
 
+	// Чистим pool-метрики удалённых БД — иначе их gauge остаются на /metrics
+	// навсегда с последним известным значением.
+	for _, name := range removedDBs {
+		dbPoolAcquired.DeleteLabelValues(name)
+		dbPoolIdle.DeleteLabelValues(name)
+		dbPoolTotal.DeleteLabelValues(name)
+	}
+
 	a.reconcileWorkers(newCfg.Queries)
 
-	a.logger.Info("smart reload complete")
+	a.logger.Info("reload complete")
 }
 
 // =========================================================================
@@ -245,8 +282,8 @@ func (a *app) reload() {
 // =========================================================================
 
 // buildPools возвращает три map:
-//   - newPools  — пулы готовые к использованию
-//   - toClose   — старые пулы которые нужно закрыть
+//   - newPools  — пулы готовые к использованию (переиспользованные и новые)
+//   - toClose   — старые пулы которые нужно закрыть (заменены новым подключением)
 //   - failed    — конфиги БД к которым не удалось подключиться
 func (a *app) buildPools(dbs map[string]DBConfig) (newPools, toClose map[string]*dbPool, failed map[string]DBConfig) {
 	newPools = make(map[string]*dbPool, len(dbs))
@@ -282,7 +319,6 @@ func (a *app) buildPools(dbs map[string]DBConfig) (newPools, toClose map[string]
 		if !ok {
 			// Не удалось создать новый пул — старый пул НЕ закрываем.
 			// Воркеры продолжают работать с существующим подключением.
-			// Новый конфиг запоминаем в failedPools для повторных попыток.
 			if exists {
 				newPools[name] = old
 			}
@@ -290,7 +326,6 @@ func (a *app) buildPools(dbs map[string]DBConfig) (newPools, toClose map[string]
 			continue
 		}
 
-		// Новый пул успешно создан — теперь можно закрыть старый
 		if exists && old != nil && old.db != nil {
 			toClose[name] = old
 		}
@@ -315,7 +350,7 @@ func (a *app) createAndPingPool(name string, dbCfg DBConfig) (*sql.DB, bool) {
 
 	dbCfg.Driver = driver
 
-	db, err := openAndPingDB(a.ctx, dbCfg)
+	db, err := openAndPingDB(a.ctx, dbCfg, a.logger)
 	if err != nil {
 		a.logger.Error("failed to open db", "db", name, "driver", dbCfg.Driver, "error", err)
 		dbConnectionErrors.WithLabelValues(name).Inc()
@@ -350,7 +385,6 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 	defaultDB := a.getDefaultDB()
 
 	for name, q := range queries {
-		// Подставляем БД по умолчанию если в запросе не указана явная БД
 		if q.DB == "" {
 			if defaultDB == "" {
 				a.logger.Error("query has no db and no default_db is set", "query", name)
@@ -366,7 +400,23 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 		}
 
 		w, exists := currentWorkers[name]
-		changed := !exists || !sameQueryConfig(w.cfg, q)
+
+		// poolChanged: тот же query config, но пул этой БД был пересоздан
+		// (например изменился url или пароль). Без этой проверки воркер
+		// продолжал бы держать ссылку на *sql.DB который reload() уже закрыл
+		// в toClose — все последующие тики этого воркера падали бы с
+		// "sql: database is closed", хотя по факту query не менялся вообще.
+		poolChanged := exists && w.pool != pEntry
+
+		// schemaChanged: изменились Labels или ValueColumn — это то, что
+		// определяет схему лейблов GaugeVec. Если рестартовать воркер но не
+		// снять старую метрику, getOrCreateQueryMetric вернёт закешированный
+		// коллектор со старой схемой, а metric.With(новые_лейблы) запаникует
+		// (GaugeVec.With паникует там, где GetMetricWith вернул бы ошибку).
+		schemaChanged := exists &&
+			(w.cfg.ValueColumn != q.ValueColumn || !sameLabels(w.cfg.Labels, q.Labels))
+
+		changed := !exists || !sameQueryConfig(w.cfg, q) || poolChanged
 		if !changed {
 			continue
 		}
@@ -375,10 +425,22 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 			a.logger.Info("stopping changed query worker", "query", name)
 			w.cancel()
 			w.wg.Wait()
+
+			if schemaChanged && w.cfg.MetricName != "" {
+				// Клоны одного файла метрик на несколько БД (cloneQueriesForDB)
+				// меняют Labels/ValueColumn синхронно в одном и том же reload —
+				// поэтому безопасно снять метрику сразу, не дожидаясь остальных
+				// клонов: они тоже увидят schemaChanged и просто не найдут метрику
+				// в кэше, getOrCreateQueryMetric создаст её заново с новой схемой.
+				unregisterQueryMetric(w.cfg.MetricName)
+			}
 		}
 
 		var prevLabels *[]prometheus.Labels
-		if exists && w.prevLabels != nil {
+		if exists && w.prevLabels != nil && !schemaChanged {
+			// Переиспользуем prevLabels только если схема лейблов не менялась —
+			// иначе в нём остались лейблы со старой схемой и reconciliation
+			// попытается Delete() с несовместимым набором ключей.
 			prevLabels = w.prevLabels
 		} else {
 			prevLabels = &[]prometheus.Labels{}
@@ -390,7 +452,7 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 
 		go startQueryWorker(ctx, wg, a.logger, name, q, pEntry.db, prevLabels)
 
-		newW := &worker{cancel: cancel, wg: wg, cfg: q, prevLabels: prevLabels}
+		newW := &worker{cancel: cancel, wg: wg, cfg: q, pool: pEntry, prevLabels: prevLabels}
 
 		a.mu.Lock()
 		a.workers[name] = newW
@@ -406,15 +468,14 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 			w.cancel()
 			wg := w.wg
 			metricName := w.cfg.MetricName
+			stoppedCfg := w.cfg
+			stoppedPrevLabels := w.prevLabels
 			delete(a.workers, name)
 
-			// Проверяем не использует ли ЕЩЁ ЖИВОЙ воркер тот же MetricName.
-			// Это случай cloneQueriesForDB: один файл метрик подключён для
-			// нескольких БД (include_defaults с списком), и у обоих воркеров
-			// одинаковый MetricName, но разные ключи (name__db1, name__db2).
-			// Если убрать только одну БД из include_defaults — нельзя снести
-			// метрику целиком, потому что воркер для второй БД продолжает
-			// в неё писать.
+			// Проверяем не использует ли ЕЩЁ ЖИВОЙ воркер тот же MetricName —
+			// случай cloneQueriesForDB, когда один файл метрик подключён для
+			// нескольких БД. Если убрать только одну БД из include_defaults,
+			// нельзя снести метрику целиком: воркер для второй БД продолжает в неё писать.
 			sharedByOthers := false
 			for otherName, otherW := range a.workers {
 				if otherName != name && otherW.cfg.MetricName == metricName {
@@ -425,12 +486,39 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 
 			a.mu.Unlock()
 			wg.Wait()
-			// Метрика убирается из Prometheus registry только после того как
-			// воркер гарантированно остановлен (wg.Wait() выше) — иначе можно
-			// поймать гонку: воркер ещё успевает сделать metric.With(...).Set()
-			// на уже отозванный коллектор между Unregister и завершением горутины.
-			if metricName != "" && !sharedByOthers {
+
+			if metricName == "" {
+				a.mu.Lock()
+				continue
+			}
+
+			if !sharedByOthers {
+				// Метрика больше никому не нужна — сносим целиком.
 				unregisterQueryMetric(metricName)
+			} else {
+				// Метрику снести нельзя — с ней ещё работает другой воркер
+				// (например для другой БД из того же include_defaults списка).
+				// Но СВОИ СТРОКИ этого воркера всё равно нужно явно удалить —
+				// иначе они останутся висеть в GaugeVec навсегда со старым
+				// значением. Это конкретно тот случай когда БД временно убрали
+				// из include_defaults списка (worker-ключ стал без суффикса __db),
+				// затем вернули обратно (ключ снова с суффиксом) без полного
+				// рестарта процесса: старый воркер с ключом без суффикса
+				// останавливается, но новый воркер с суффиксом стартует под
+				// ДРУГИМ ключом карты a.workers и ничего не знает о старых
+				// строках прежнего воркера — они не перезаписываются и
+				// выглядят как "два значения метрики одновременно".
+				if metric, exists := lookupQueryMetric(metricName); exists {
+					if stoppedPrevLabels != nil && len(*stoppedPrevLabels) > 0 {
+						// Multi-row: удаляем каждую строку, которую держал этот воркер.
+						for _, lbl := range *stoppedPrevLabels {
+							metric.Delete(lbl)
+						}
+					} else {
+						// Single-value: у воркера ровно одна комбинация лейблов.
+						metric.Delete(buildLabelValues(stoppedCfg.DB, stoppedCfg.Labels, nil))
+					}
+				}
 			}
 			a.mu.Lock()
 		}

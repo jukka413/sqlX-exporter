@@ -39,7 +39,17 @@ func startQueryWorker(
 	}
 
 	runner := newSingleRunner(ctx, logger, name, prevLabels)
-	defer runner.cancelCurrent()
+	// Отменяем И ждём завершения текущего запроса перед выходом. Раньше здесь
+	// был только runner.cancelCurrent() без Wait() — outer wg.Done() (см. верх
+	// функции) срабатывал сразу, а caller (reconcileWorkers/stopAllWorkers),
+	// дождавшись только wg.Wait(), считал воркер полностью остановленным и мог
+	// unregister-ить метрику или запустить новый воркер с тем же prevLabels
+	// указателем, пока старая горутина ещё дописывает результат — гонка данных
+	// по *prevLabels и возможная запись в уже отозванный Prometheus-коллектор.
+	defer func() {
+		runner.cancelCurrent()
+		runner.currentWg.Wait()
+	}()
 
 	// --- Scheduled mode ---
 	if queryCfg.Schedule != nil {
@@ -76,6 +86,11 @@ func startQueryWorker(
 	defer ticker.Stop()
 
 	logger.Info("started interval query worker", "query", metricName, "db", queryCfg.DB)
+
+	// Выполняем первый запрос сразу, не дожидаясь первого тика — иначе
+	// /metrics остаётся пустым до interval секунд после каждого старта Pod
+	// или после каждого рестарта воркера из-за изменения конфига.
+	runner.run(queryCfg, db, timeout)
 
 	for {
 		select {
@@ -217,7 +232,7 @@ func classifyError(workerCtx, queryCtx context.Context) string {
 	if workerCtx.Err() == context.Canceled {
 		return "cancelled"
 	}
-	if queryCtx.Err() != nil || errors.Is(queryCtx.Err(), context.DeadlineExceeded) {
+	if errors.Is(queryCtx.Err(), context.DeadlineExceeded) {
 		return "timeout"
 	}
 	return "db_error"
@@ -249,8 +264,10 @@ func runSingleValue(
 
 	value, ok := toFloat64(result)
 	if !ok {
-		logger.Error("query result is not numeric", "query", name, "db", queryCfg.DB)
-		return nil
+		// Раньше здесь был return nil — runOnce считал такой запуск успешным
+		// и выставлял queryUp=1 / queryLastSuccess несмотря на то что метрика
+		// фактически не обновилась. Теперь это настоящая ошибка запроса.
+		return fmt.Errorf("query result is not numeric: %T", result)
 	}
 
 	metric := getOrCreateQueryMetric(name, queryCfg.Labels, nil)
@@ -312,6 +329,25 @@ func runMultiRow(
 		if i != valueColIdx {
 			colLabelNames = append(colLabelNames, col)
 		}
+	}
+
+	// Защита от коллизии имён лейблов: если SQL-столбец называется "db" (лейбл
+	// который приложение проставляет само) или совпадает с именем статического
+	// лейбла из labels:, buildLabelValues молча перезаписал бы одно значение
+	// другим при заполнении map. Без этой проверки данные в метрике были бы
+	// незаметно неверными (например реальное имя БД подменялось бы значением
+	// из результата SQL). Проверить заранее на этапе конфига нельзя — имена
+	// столбцов известны только после выполнения запроса.
+	seenLabelNames := make(map[string]struct{}, len(colLabelNames)+len(queryCfg.Labels)+1)
+	seenLabelNames["db"] = struct{}{}
+	for k := range queryCfg.Labels {
+		seenLabelNames[k] = struct{}{}
+	}
+	for _, col := range colLabelNames {
+		if _, collision := seenLabelNames[col]; collision {
+			return nil, fmt.Errorf("column %q collides with a reserved or static label name", col)
+		}
+		seenLabelNames[col] = struct{}{}
 	}
 
 	metric := getOrCreateQueryMetric(name, queryCfg.Labels, colLabelNames)

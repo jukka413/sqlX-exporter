@@ -55,6 +55,21 @@ type Config struct {
 	// потому что для них не нашлось записи в include_defaults.
 	// Не из YAML — заполняется кодом при загрузке, для логирования в app.go.
 	skippedIncludes []string `yaml:"-"`
+
+	// missingEnvVars — список переменных окружения упомянутых в url через
+	// ${VAR}, которые не были найдены в окружении при загрузке. Не из YAML —
+	// заполняется кодом, для логирования в app.go. Без этого отсутствующая
+	// переменная тихо превращалась в пустой пароль и проявлялась только как
+	// загадочная ошибка аутентификации на стороне БД (например ORA-01017).
+	missingEnvVars []string `yaml:"-"`
+
+	// overwritten — список случаев когда инклюд перезаписал существующий
+	// database/query с другим значением. Не из YAML — заполняется кодом,
+	// для логирования в app.go. Без этого коллизия имён между двумя
+	// независимыми инклюд-файлами (например из разных Git-репозиториев)
+	// проходит абсолютно молча — метрика продолжает существовать под тем же
+	// именем, но начинает собирать данные с другой БД или по другому SQL.
+	overwritten []string `yaml:"-"`
 }
 
 // IncludeDefault поддерживает как строку так и список строк в YAML:
@@ -139,26 +154,23 @@ type ScheduleAt struct {
 
 // loadConfig загружает конфиг из файла path и рекурсивно обрабатывает includes.
 func loadConfig(path string) (Config, error) {
-	// Предварительное чтение для получения глобального default_db и include_defaults
-	// до того как они нужны дочерним инклюдам. Ошибки здесь намеренно не считаются
-	// фатальными на этом шаге — тот же файл будет прочитан и провалидирован
-	// по-настоящему внутри loadConfigWithContext, и там ошибка корректно вернётся
-	// наружу. Если этот шаг тихо не сработал (плохой YAML, нет файла) —
-	// globalDefault/IncludeDefaults останутся пустыми, что эквивалентно их отсутствию
-	// в конфиге, и не маскирует реальную ошибку — она всплывёт чуть ниже.
 	var preview Config
 	data, err := os.ReadFile(path)
 	if err == nil {
-		// Ошибку Unmarshal здесь сознательно не пробрасываем — невалидный YAML
-		// будет повторно обработан (и вернёт понятную ошибку с точным местом)
-		// внутри loadConfigWithContext на той же строке кода.
 		_ = yaml.Unmarshal(data, &preview)
 	}
 	globalDefault := preview.DefaultDB
 	if globalDefault == "" {
 		globalDefault = preview.Settings.DefaultDB
 	}
-	return loadConfigWithContext(path, 0, globalDefault, preview.IncludeDefaults)
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		absPath = path
+	}
+	rootDir := filepath.Dir(absPath)
+
+	return loadConfigWithContext(path, 0, globalDefault, preview.IncludeDefaults, rootDir)
 }
 
 const maxIncludeDepth = 10
@@ -166,7 +178,10 @@ const maxIncludeDepth = 10
 // loadConfigWithContext загружает конфиг передавая контекст от родителя:
 //   - parentDefaultDB — глобальный default_db от родителя
 //   - parentIncludeDefaults — маппинг include_defaults от родителя
-func loadConfigWithContext(path string, depth int, parentDefaultDB string, parentIncludeDefaults map[string]IncludeDefault) (Config, error) {
+//   - rootDir — директория основного (корневого) конфига; все инклюды должны
+//     резолвиться внутри неё, это защита от path traversal через includes
+//     (например includes: {"../../../etc/something.yaml": true})
+func loadConfigWithContext(path string, depth int, parentDefaultDB string, parentIncludeDefaults map[string]IncludeDefault, rootDir string) (Config, error) {
 	var cfg Config
 
 	if depth > maxIncludeDepth {
@@ -182,7 +197,7 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 		return cfg, err
 	}
 
-	expandURLs(&cfg)
+	cfg.missingEnvVars = expandURLs(&cfg)
 
 	// Проставляем MetricName = имя запроса для каждого запроса.
 	// Это нужно до клонирования — при клонировании ключ изменится но MetricName останется.
@@ -221,37 +236,66 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 		sort.Strings(includePaths)
 
 		for _, includePath := range includePaths {
-			fullPath := filepath.Join(baseDir, includePath)
-			baseName := filepath.Base(includePath)
+			// includes — map[string]bool. false означает "временно выключен" —
+			// пропускаем без загрузки, но и без включения в skippedIncludes
+			// (это осознанное отключение автором конфига, а не "забыли настроить").
+			if !cfg.Includes[includePath] {
+				continue
+			}
 
-			// Файл загружается ТОЛЬКО если для него есть запись в include_defaults.
-			// Без записи — файл осознанно игнорируется (см. skippedIncludes ниже).
-			// Это позволяет держать файлы метрик переиспользуемыми: добавление
-			// файла в includes без include_defaults безопасно ничего не делает,
-			// а не падает с ошибкой "db is required".
-			dbs, ok := effectiveIncludeDefaults[baseName]
+			fullPath := filepath.Join(baseDir, includePath)
+
+			// Path traversal guard: резолвленный путь должен оставаться внутри
+			// rootDir корневого конфига. Без этой проверки includes с "../.."
+			// мог бы читать произвольные файлы с того же volume, к которым
+			// у процесса есть доступ на чтение.
+			absFullPath, err := filepath.Abs(fullPath)
+			if err != nil {
+				return cfg, fmt.Errorf("include %q: cannot resolve absolute path: %w", includePath, err)
+			}
+			rel, err := filepath.Rel(rootDir, absFullPath)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return cfg, fmt.Errorf("include %q resolves outside the config root directory %q", includePath, rootDir)
+			}
+
+			// Ищем запись в include_defaults сначала по полному include path
+			// (например "team-a/metrics.yaml"), и только если такой записи нет —
+			// по basename ("metrics.yaml") для обратной совместимости. Без этого
+			// приоритета "team-a/metrics.yaml" и "team-b/metrics.yaml" искали бы
+			// одну и ту же запись "metrics.yaml" и получили бы одинаковую БД.
+			baseName := filepath.Base(includePath)
+			dbs, ok := effectiveIncludeDefaults[includePath]
 			if !ok {
+				dbs, ok = effectiveIncludeDefaults[baseName]
+			}
+			if !ok {
+				// Файл загружается ТОЛЬКО если для него есть запись в include_defaults.
+				// Без записи — файл осознанно игнорируется. Это позволяет держать
+				// файлы метрик переиспользуемыми: добавление файла в includes без
+				// include_defaults безопасно ничего не делает, а не падает с
+				// ошибкой "db is required".
 				cfg.skippedIncludes = append(cfg.skippedIncludes,
 					fmt.Sprintf("%q: no entry in include_defaults", includePath))
 				continue
 			}
 
-			// Загружаем файл для каждой БД и мержим.
-			// Если БД несколько — все запросы получают суффикс _dbname
-			// чтобы воркеры были уникальны. Лейбл db в метрике всё равно
-			// различает их в Prometheus.
+			// Загружаем файл для каждой БД и мержим. Если БД несколько — все
+			// запросы получают суффикс __db чтобы воркеры были уникальны.
+			// Лейбл db в метрике всё равно различает их в Prometheus.
 			addSuffix := len(dbs) > 1
 			for _, db := range dbs {
-				inc, err := loadConfigWithContext(fullPath, depth+1, db, effectiveIncludeDefaults)
+				inc, err := loadConfigWithContext(fullPath, depth+1, db, effectiveIncludeDefaults, rootDir)
 				if err != nil {
 					return cfg, fmt.Errorf("include %q (db=%s): %w", fullPath, db, err)
 				}
 				if addSuffix {
 					inc = cloneQueriesForDB(inc, db)
 				}
-				mergeConfig(&cfg, inc)
-				// Переносим skippedIncludes из дочернего конфига наверх
+				mergeConfig(&cfg, inc, includePath)
+				// Переносим служебные списки из дочернего конфига наверх
 				cfg.skippedIncludes = append(cfg.skippedIncludes, inc.skippedIncludes...)
+				cfg.missingEnvVars = append(cfg.missingEnvVars, inc.missingEnvVars...)
+				cfg.overwritten = append(cfg.overwritten, inc.overwritten...)
 			}
 		}
 		cfg.Includes = nil
@@ -289,26 +333,59 @@ func applyDefaultDB(cfg *Config, defaultDB string) {
 // expandURLs подставляет переменные окружения только в поля url баз данных.
 //
 // Значения по умолчанию URL-кодируются чтобы спецсимволы в паролях
-// (@ / + # % & : пробел и др.) не ломали парсинг URL.
+// (@ / + # % & : = пробел и др.) не ломали парсинг URL. Используется
+// url.QueryEscape, так как он кодирует более широкий набор символов чем
+// url.PathEscape (в частности "=", который PathEscape сознательно
+// пропускает как разрешённый в path-сегменте по RFC 3986).
 //
 // Исключение — значения похожие на TNS-дескриптор Oracle:
 // "(DESCRIPTION=(ADDRESS=...)...)" — такие значения НЕ кодируются,
 // иначе скобки и = превратятся в %28 %29 %3D и resolveDSN не сможет
 // распознать и распарсить TNS-дескриптор в db.go.
-func expandURLs(cfg *Config) {
+//
+// ВАЖНО (исправленный баг): раньше отсутствующая переменная окружения
+// (опечатка в имени, незапримонтированный Secret, неверный регистр —
+// например ${password} в конфиге vs PASSWORD в env) тихо подставлялась
+// как пустая строка через os.Getenv, который не различает "переменной нет
+// вообще" и "переменная есть, но реально пустая". В результате URL
+// собирался вида "oracle://user:@host:1521/service" — с пустым паролем —
+// без единой ошибки на этапе загрузки конфига. Дальше Oracle совершенно
+// ожидаемо отвечает ORA-01017 "invalid username/password" (соединение
+// доходит до сервера — поэтому не "connection refused", просто пустой
+// пароль действительно неверен), и по одному этому сообщению невозможно
+// понять, что переменная окружения вовсе не была найдена.
+//
+// Теперь используется os.LookupEnv, который явно возвращает найдена ли
+// переменная, и все ненайденные собираются в missingVars — для
+// предупреждения в логах при reload (см. вызов в app.go).
+func expandURLs(cfg *Config) (missingVars []string) {
+	seen := make(map[string]struct{})
+
 	for name, db := range cfg.Databases {
 		db.URL = os.Expand(db.URL, func(key string) string {
-			val := os.Getenv(key)
+			val, ok := os.LookupEnv(key)
+			if !ok {
+				warning := fmt.Sprintf("database %q: ${%s} is not set in environment", name, key)
+				if _, dup := seen[warning]; !dup {
+					seen[warning] = struct{}{}
+					missingVars = append(missingVars, warning)
+				}
+				return ""
+			}
 			if val == "" {
+				// Переменная явно задана как пустая строка — это может быть
+				// осознанным выбором, не считаем ошибкой и не предупреждаем.
 				return ""
 			}
 			if looksLikeTNSDescriptor(val) {
 				return val // подставляем как есть, без кодирования
 			}
-			return url.PathEscape(val)
+			return url.QueryEscape(val)
 		})
 		cfg.Databases[name] = db
 	}
+
+	return missingVars
 }
 
 // looksLikeTNSDescriptor определяет похоже ли значение на TNS-дескриптор Oracle.
@@ -341,19 +418,13 @@ func cloneQueriesForDB(cfg Config, db string) Config {
 	return cfg
 }
 
-// mergeConfig мержит src в dst.
-// src (инклюд) имеет приоритет — перезаписывает существующие ключи.
-//
-// ВНИМАНИЕ (известный риск, не исправлено): если два разных инклюд-файла
-// (например из разных Git-репозиториев в multi-source ArgoCD) случайно
-// объявляют запрос с одинаковым именем — один тихо перезапишет другой
-// без какого-либо предупреждения, потому что mergeConfig не имеет доступа
-// к логгеру и не сравнивает старое/новое значение перед записью.
-// Симптом в проде: метрика которая должна обновляться от одной БД,
-// внезапно начинает работать с другой, без единой строки в логах.
-// TODO: либо протащить logger через loadConfigWithContext → mergeConfig,
-// либо возвращать []string с предупреждениями как делает sanitizeQueries.
-func mergeConfig(dst *Config, src Config) {
+// mergeConfig мержит src в dst. src (инклюд из sourceLabel) имеет приоритет —
+// перезаписывает существующие ключи. Коллизии (когда src перезаписывает
+// ключ dst с ДРУГИМ значением) записываются в dst.overwritten для логирования
+// в app.go — иначе такая коллизия проходит абсолютно молча: метрика
+// продолжает существовать под тем же именем, но начинает собирать данные
+// с другой БД или по другому SQL без единой строки в логах.
+func mergeConfig(dst *Config, src Config, sourceLabel string) {
 	if src.Settings.DBReconnectInterval != "" {
 		dst.Settings.DBReconnectInterval = src.Settings.DBReconnectInterval
 	}
@@ -365,6 +436,10 @@ func mergeConfig(dst *Config, src Config) {
 		dst.Databases = make(map[string]DBConfig)
 	}
 	for name, db := range src.Databases {
+		if existing, exists := dst.Databases[name]; exists && existing != db {
+			dst.overwritten = append(dst.overwritten,
+				fmt.Sprintf("database %q overwritten by include %q", name, sourceLabel))
+		}
 		dst.Databases[name] = db
 	}
 
@@ -372,6 +447,10 @@ func mergeConfig(dst *Config, src Config) {
 		dst.Queries = make(map[string]QueryConfig)
 	}
 	for name, q := range src.Queries {
+		if existing, exists := dst.Queries[name]; exists && !sameQueryConfig(existing, q) {
+			dst.overwritten = append(dst.overwritten,
+				fmt.Sprintf("query %q overwritten by include %q", name, sourceLabel))
+		}
 		dst.Queries[name] = q
 	}
 }
@@ -407,19 +486,89 @@ func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
 			return fmt.Sprintf("db %q is not defined in databases", q.DB)
 		}
 	}
-	if _, err := time.ParseDuration(q.Timeout); err != nil {
+
+	timeout, err := time.ParseDuration(q.Timeout)
+	if err != nil {
 		return fmt.Sprintf("invalid timeout: %v", err)
+	}
+	if timeout <= 0 {
+		return "timeout must be positive"
+	}
+
+	if q.Schedule != nil && q.Interval != "" {
+		return "interval and schedule are mutually exclusive"
 	}
 	if q.Schedule != nil {
 		if err := validateSchedule(q.Schedule); err != nil {
 			return fmt.Sprintf("invalid schedule: %v", err)
 		}
 	} else {
-		if _, err := time.ParseDuration(q.Interval); err != nil {
+		interval, err := time.ParseDuration(q.Interval)
+		if err != nil {
 			return fmt.Sprintf("invalid interval: %v", err)
 		}
+		if interval <= 0 {
+			return "interval must be positive"
+		}
 	}
+
+	if !isValidPrometheusName(name) {
+		return fmt.Sprintf("query name %q is not a valid Prometheus metric name", name)
+	}
+	for label := range q.Labels {
+		if label == "db" {
+			return `static label "db" is reserved (always set automatically) and cannot be overridden`
+		}
+		if !isValidPrometheusLabelName(label) {
+			return fmt.Sprintf("static label %q is not a valid Prometheus label name", label)
+		}
+	}
+
 	return ""
+}
+
+// isValidPrometheusName проверяет валидность имени метрики по правилам Prometheus:
+// [a-zA-Z_:][a-zA-Z0-9_:]*
+func isValidPrometheusName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || r == ':'
+		isDigit := r >= '0' && r <= '9'
+		if i == 0 {
+			if !isLetter {
+				return false
+			}
+			continue
+		}
+		if !isLetter && !isDigit {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidPrometheusLabelName проверяет валидность имени лейбла по правилам Prometheus:
+// [a-zA-Z_][a-zA-Z0-9_]*, не начинается с "__" (зарезервировано для внутреннего использования).
+func isValidPrometheusLabelName(name string) bool {
+	if name == "" || strings.HasPrefix(name, "__") {
+		return false
+	}
+	for i, r := range name {
+		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_'
+		isDigit := r >= '0' && r <= '9'
+		if i == 0 {
+			if !isLetter {
+				return false
+			}
+			continue
+		}
+		if !isLetter && !isDigit {
+			return false
+		}
+	}
+	return true
 }
 
 // validateDatabasesAndSettings проверяет критичные части конфига —
@@ -427,8 +576,12 @@ func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
 // означают структурно сломанный конфиг (а не опечатку в одном запросе).
 func validateDatabasesAndSettings(cfg Config) error {
 	if cfg.Settings.DBReconnectInterval != "" {
-		if _, err := time.ParseDuration(cfg.Settings.DBReconnectInterval); err != nil {
+		d, err := time.ParseDuration(cfg.Settings.DBReconnectInterval)
+		if err != nil {
 			return fmt.Errorf("settings.db_reconnect_interval is invalid: %w", err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("settings.db_reconnect_interval must be positive")
 		}
 	}
 	if cfg.Settings.DefaultDB != "" {
@@ -449,13 +602,21 @@ func validateDatabasesAndSettings(cfg Config) error {
 				name, db.MaxIdleConns, db.MaxConns)
 		}
 		if db.MaxConnLifetime != "" {
-			if _, err := time.ParseDuration(db.MaxConnLifetime); err != nil {
+			d, err := time.ParseDuration(db.MaxConnLifetime)
+			if err != nil {
 				return fmt.Errorf("database %q has invalid max_conn_lifetime: %w", name, err)
+			}
+			if d <= 0 {
+				return fmt.Errorf("database %q: max_conn_lifetime must be positive", name)
 			}
 		}
 		if db.MaxConnIdleTime != "" {
-			if _, err := time.ParseDuration(db.MaxConnIdleTime); err != nil {
+			d, err := time.ParseDuration(db.MaxConnIdleTime)
+			if err != nil {
 				return fmt.Errorf("database %q has invalid max_conn_idle_time: %w", name, err)
+			}
+			if d <= 0 {
+				return fmt.Errorf("database %q: max_conn_idle_time must be positive", name)
 			}
 		}
 		if db.HealthCheckPeriod != "" {

@@ -40,12 +40,34 @@ func validateSchedule(s *ScheduleConfig) error {
 	return nil
 }
 
+// sameQueryConfig сравнивает две версии конфига запроса чтобы решить нужен ли
+// рестарт воркера. Обязательно сравнивает Labels и ValueColumn — это те поля
+// которые определяют схему лейблов Prometheus-метрики (GaugeVec). Если они
+// изменились, а рестарта не произойдёт, следующий вызов metric.With(labels)
+// получит набор лейблов, не совпадающий с тем что было при создании GaugeVec,
+// и запаникует (GaugeVec.With паникует там, где GetMetricWith вернул бы ошибку).
 func sameQueryConfig(a, b QueryConfig) bool {
 	return a.DB == b.DB &&
 		a.SQL == b.SQL &&
 		a.Timeout == b.Timeout &&
 		a.Interval == b.Interval &&
+		a.ValueColumn == b.ValueColumn &&
+		sameLabels(a.Labels, b.Labels) &&
 		sameSchedule(a.Schedule, b.Schedule)
+}
+
+// sameLabels сравнивает две карты статических лейблов. nil и пустая карта
+// считаются равными — обе означают "лейблов нет".
+func sameLabels(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
 }
 
 func sameSchedule(a, b *ScheduleConfig) bool {
