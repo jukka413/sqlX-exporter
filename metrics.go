@@ -226,3 +226,27 @@ func unregisterQueryMetric(queryName string) {
 	prometheus.Unregister(m)
 	delete(queryResultMetrics, queryName)
 }
+
+// deleteWorkerRows удаляет все Prometheus-строки, за которые отвечал воркер,
+// не трогая регистрацию самой метрики (метрика может ещё использоваться
+// другими воркерами с тем же MetricName). Для multi-row удаляет каждую строку
+// из prevLabels; для single-value (prevLabels пуст) — единственную строку,
+// вычисленную из текущей комбинации лейблов cfg.
+//
+// Используется в двух местах: когда воркер полностью убран но метрику нельзя
+// снести целиком (её использует другой воркер), и когда воркер перезапускается
+// с другим значением env — в обоих случаях "старые" строки иначе остались бы
+// висеть в GaugeVec навсегда, так как никто их больше не перезаписывает.
+func deleteWorkerRows(cfg QueryConfig, prevLabels *[]prometheus.Labels) {
+	m, ok := lookupQueryMetric(cfg.MetricName)
+	if !ok {
+		return
+	}
+	if prevLabels != nil && len(*prevLabels) > 0 {
+		for _, lbl := range *prevLabels {
+			m.Delete(lbl)
+		}
+		return
+	}
+	m.Delete(buildLabelValues(cfg.DB, cfg.DBEnv, cfg.Labels, nil))
+}

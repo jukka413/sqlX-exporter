@@ -311,6 +311,20 @@ func (a *app) buildPools(dbs map[string]DBConfig) (newPools, toClose map[string]
 			old.cfg.HealthCheckPeriod != dbCfg.HealthCheckPeriod
 
 		if !needUpdate {
+			if exists && old.cfg.Env != dbCfg.Env {
+				// Только Env изменился — реконнект не нужен (тот же *sql.DB),
+				// но мутировать old.cfg.Env "на месте" нельзя: это shared
+				// указатель, который reconcileWorkers может читать из другой
+				// горутины без синхронизации — гонка данных. Вместо этого
+				// создаём новую обёртку dbPool с тем же соединением. Смена
+				// указателя естественным образом сработает через уже
+				// существующую проверку poolChanged в reconcileWorkers —
+				// воркеры, использующие эту БД, перезапустятся и подхватят
+				// новое значение q.DBEnv, без единой лишней строчки кода
+				// специально под "env изменился".
+				newPools[name] = &dbPool{cfg: dbCfg, db: old.db}
+				continue
+			}
 			newPools[name] = old
 			continue
 		}
@@ -422,7 +436,15 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 		schemaChanged := exists &&
 			(w.cfg.ValueColumn != q.ValueColumn || !sameLabels(w.cfg.Labels, q.Labels))
 
-		changed := !exists || !sameQueryConfig(w.cfg, q) || poolChanged
+		// envChanged: у БД этого запроса поменялось значение env (например
+		// БД переклассифицировали test → prod). Схема лейблов не меняется
+		// (env как лейбл присутствует всегда), меняется только значение —
+		// поэтому schemaChanged это не ловит, а без явной обработки старая
+		// строка с прежним env остаётся висеть в метрике навсегда, потому
+		// что новый воркер пишет уже под другим значением env.
+		envChanged := exists && w.cfg.DBEnv != q.DBEnv
+
+		changed := !exists || !sameQueryConfig(w.cfg, q) || poolChanged || envChanged
 		if !changed {
 			continue
 		}
@@ -439,14 +461,22 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 				// клонов: они тоже увидят schemaChanged и просто не найдут метрику
 				// в кэше, getOrCreateQueryMetric создаст её заново с новой схемой.
 				unregisterQueryMetric(w.cfg.MetricName)
+			} else if envChanged && w.cfg.MetricName != "" {
+				// Снести всю метрику нельзя (другие БД/значения env могут
+				// её ещё использовать), но собственные строки этого воркера
+				// со старым env нужно убрать явно — иначе они останутся
+				// висеть в GaugeVec навсегда, потому что новый воркер пишет
+				// уже под другим значением env и никогда их не перезапишет.
+				deleteWorkerRows(w.cfg, w.prevLabels)
 			}
 		}
 
 		var prevLabels *[]prometheus.Labels
-		if exists && w.prevLabels != nil && !schemaChanged {
-			// Переиспользуем prevLabels только если схема лейблов не менялась —
-			// иначе в нём остались лейблы со старой схемой и reconciliation
-			// попытается Delete() с несовместимым набором ключей.
+		if exists && w.prevLabels != nil && !schemaChanged && !envChanged {
+			// Переиспользуем prevLabels только если ни схема лейблов, ни
+			// значение env не менялись — иначе в нём остались лейблы под
+			// старым env и reconciliation попытается Delete() строки,
+			// которые уже не совпадают с текущим набором.
 			prevLabels = w.prevLabels
 		} else {
 			prevLabels = &[]prometheus.Labels{}
@@ -514,17 +544,7 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 				// ДРУГИМ ключом карты a.workers и ничего не знает о старых
 				// строках прежнего воркера — они не перезаписываются и
 				// выглядят как "два значения метрики одновременно".
-				if metric, exists := lookupQueryMetric(metricName); exists {
-					if stoppedPrevLabels != nil && len(*stoppedPrevLabels) > 0 {
-						// Multi-row: удаляем каждую строку, которую держал этот воркер.
-						for _, lbl := range *stoppedPrevLabels {
-							metric.Delete(lbl)
-						}
-					} else {
-						// Single-value: у воркера ровно одна комбинация лейблов.
-						metric.Delete(buildLabelValues(stoppedCfg.DB, stoppedCfg.DBEnv, stoppedCfg.Labels, nil))
-					}
-				}
+				deleteWorkerRows(stoppedCfg, stoppedPrevLabels)
 			}
 			a.mu.Lock()
 		}
