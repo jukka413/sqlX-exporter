@@ -151,14 +151,19 @@ func getOrCreateQueryMetric(queryName string, customLabels map[string]string, co
 
 // buildLabelNames возвращает упорядоченный список имён лейблов:
 //  1. "db" — всегда первый
-//  2. статические лейблы из customLabels — в алфавитном порядке
-//  3. динамические лейблы из colLabels (имена столбцов) — в исходном порядке столбцов
+//  2. "env" — всегда второй, значение из databases.<db>.env (пустая строка если
+//     не задано). Присутствует всегда, а не только когда env реально указан —
+//     иначе GaugeVec для одного и того же имени метрики мог бы получить разные
+//     наборы лейблов при клонировании запроса на несколько БД (одна с env,
+//     другая без), что приводит к панике при With().
+//  3. статические лейблы из customLabels — в алфавитном порядке
+//  4. динамические лейблы из colLabels (имена столбцов) — в исходном порядке столбцов
 //
 // Такой порядок гарантирует стабильность между вызовами — Prometheus требует
 // чтобы имена и значения лейблов передавались в одном и том же порядке.
 func buildLabelNames(customLabels map[string]string, colLabels []string) []string {
-	names := make([]string, 0, 1+len(customLabels)+len(colLabels))
-	names = append(names, "db")
+	names := make([]string, 0, 2+len(customLabels)+len(colLabels))
+	names = append(names, "db", "env")
 
 	// Статические лейблы из конфига — сортируем для детерминированности
 	staticKeys := make([]string, 0, len(customLabels))
@@ -175,10 +180,11 @@ func buildLabelNames(customLabels map[string]string, colLabels []string) []strin
 }
 
 // buildLabelValues возвращает map лейблов со значениями для передачи в metric.With().
-// Принимает те же три источника что buildLabelNames.
-func buildLabelValues(dbName string, customLabels map[string]string, colLabelValues map[string]string) prometheus.Labels {
-	labels := make(prometheus.Labels, 1+len(customLabels)+len(colLabelValues))
+// envValue — значение databases.<db>.env для БД этого запроса, может быть "".
+func buildLabelValues(dbName, envValue string, customLabels map[string]string, colLabelValues map[string]string) prometheus.Labels {
+	labels := make(prometheus.Labels, 2+len(customLabels)+len(colLabelValues))
 	labels["db"] = dbName
+	labels["env"] = envValue
 	for k, v := range customLabels {
 		labels[k] = v
 	}

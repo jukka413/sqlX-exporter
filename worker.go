@@ -257,7 +257,7 @@ func runSingleValue(
 		// Удаляем метрику — данные устарели
 		metric, exists := lookupQueryMetric(name)
 		if exists {
-			metric.Delete(buildLabelValues(queryCfg.DB, queryCfg.Labels, nil))
+			metric.Delete(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil))
 		}
 		return err
 	}
@@ -271,7 +271,7 @@ func runSingleValue(
 	}
 
 	metric := getOrCreateQueryMetric(name, queryCfg.Labels, nil)
-	metric.With(buildLabelValues(queryCfg.DB, queryCfg.Labels, nil)).Set(value)
+	metric.With(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil)).Set(value)
 
 	logger.Info("query value", "query", name, "db", queryCfg.DB, "value", value)
 	return nil
@@ -331,15 +331,15 @@ func runMultiRow(
 		}
 	}
 
-	// Защита от коллизии имён лейблов: если SQL-столбец называется "db" (лейбл
-	// который приложение проставляет само) или совпадает с именем статического
-	// лейбла из labels:, buildLabelValues молча перезаписал бы одно значение
-	// другим при заполнении map. Без этой проверки данные в метрике были бы
-	// незаметно неверными (например реальное имя БД подменялось бы значением
-	// из результата SQL). Проверить заранее на этапе конфига нельзя — имена
-	// столбцов известны только после выполнения запроса.
-	seenLabelNames := make(map[string]struct{}, len(colLabelNames)+len(queryCfg.Labels)+1)
+	// Защита от коллизии имён лейблов: если SQL-столбец называется "db"/"env"
+	// (лейблы которые приложение проставляет само) или совпадает с именем
+	// статического лейбла из labels:, buildLabelValues молча перезаписал бы
+	// одно значение другим при заполнении map. Без этой проверки данные в
+	// метрике были бы незаметно неверными. Проверить заранее на этапе конфига
+	// нельзя — имена столбцов известны только после выполнения запроса.
+	seenLabelNames := make(map[string]struct{}, len(colLabelNames)+len(queryCfg.Labels)+2)
 	seenLabelNames["db"] = struct{}{}
+	seenLabelNames["env"] = struct{}{}
 	for k := range queryCfg.Labels {
 		seenLabelNames[k] = struct{}{}
 	}
@@ -385,7 +385,7 @@ func runMultiRow(
 			}
 		}
 
-		lbls := buildLabelValues(queryCfg.DB, queryCfg.Labels, colLabelValues)
+		lbls := buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, colLabelValues)
 		metric.With(lbls).Set(value)
 		currentLabels = append(currentLabels, lbls)
 	}

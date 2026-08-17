@@ -399,6 +399,12 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 			continue
 		}
 
+		// DBEnv резолвится здесь, не при загрузке конфига — только тут известна
+		// связка "запрос → его пул". Должно быть выставлено ДО sameQueryConfig
+		// ниже, иначе сравнение всегда считало бы конфиг изменившимся
+		// (у нового q.DBEnv ещё пусто, а у старого воркера уже проставлено).
+		q.DBEnv = pEntry.cfg.Env
+
 		w, exists := currentWorkers[name]
 
 		// poolChanged: тот же query config, но пул этой БД был пересоздан
@@ -516,7 +522,7 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 						}
 					} else {
 						// Single-value: у воркера ровно одна комбинация лейблов.
-						metric.Delete(buildLabelValues(stoppedCfg.DB, stoppedCfg.Labels, nil))
+						metric.Delete(buildLabelValues(stoppedCfg.DB, stoppedCfg.DBEnv, stoppedCfg.Labels, nil))
 					}
 				}
 			}

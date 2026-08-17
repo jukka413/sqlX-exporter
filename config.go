@@ -115,6 +115,12 @@ type DBConfig struct {
 	Driver string `yaml:"driver"`
 	URL    string `yaml:"url"`
 
+	// Env — окружение этой БД (prod, test, dev и т.д.). Если задано,
+	// автоматически добавляется как лейбл "env" ко всем метрикам,
+	// использующим эту БД — не нужно прописывать labels: env вручную
+	// в каждом запросе. Опционально: если не задано, лейбл env не добавляется.
+	Env string `yaml:"env,omitempty"`
+
 	MaxConns     int `yaml:"max_conns"`
 	MaxIdleConns int `yaml:"max_idle_conns"`
 
@@ -140,6 +146,12 @@ type QueryConfig struct {
 	// (name+db), но MetricName остаётся оригинальным именем запроса.
 	// Это позволяет иметь одинаковое имя метрики для разных БД без суффиксов.
 	MetricName string `yaml:"-"` // не читается из YAML, проставляется кодом
+
+	// DBEnv — значение databases.<db>.env для той БД, к которой привязан
+	// этот запрос. Не из YAML — проставляется в app.reconcileWorkers в момент
+	// резолва q.DB → *dbPool, потому что именно там впервые известны и запрос,
+	// и его пул одновременно. Пробрасывается в worker.go как лейбл "env".
+	DBEnv string `yaml:"-"`
 }
 
 type ScheduleConfig struct {
@@ -516,8 +528,8 @@ func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
 		return fmt.Sprintf("query name %q is not a valid Prometheus metric name", name)
 	}
 	for label := range q.Labels {
-		if label == "db" {
-			return `static label "db" is reserved (always set automatically) and cannot be overridden`
+		if label == "db" || label == "env" {
+			return fmt.Sprintf("static label %q is reserved (always set automatically) and cannot be overridden", label)
 		}
 		if !isValidPrometheusLabelName(label) {
 			return fmt.Sprintf("static label %q is not a valid Prometheus label name", label)
