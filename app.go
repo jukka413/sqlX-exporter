@@ -70,6 +70,18 @@ type app struct {
 	// оба создают новые пулы, один из результатов теряется без Close(): утечка
 	// соединения которая никогда не попадёт в toClose ни одного из двух вызовов.
 	reloadMu sync.Mutex
+
+	// configGeneration увеличивается на 1 в начале каждого успешного reload().
+	// poolHealthChecker снимает текущее значение вместе со снэпшотом failedPools/
+	// queriesCfg; createAndPingPool может занимать до 5с (или больше) на каждую
+	// БД, и всё это время reload() может выполниться параллельно — удалить эту
+	// БД из конфига, поменять её URL или изменить queries. Без проверки
+	// поколения checker, завершившись позже, слепо перезаписал бы a.pools[name]
+	// своим (уже устаревшим) результатом — «воскрешая» удалённую/изменённую БД
+	// и применяя reconcileWorkers со старым снэпшотом queries поверх того, что
+	// reload() уже применил. checker сравнивает своё сохранённое поколение с
+	// текущим перед коммитом результата и отбрасывает его, если оно устарело.
+	configGeneration uint64
 }
 
 // getDefaultDB безопасно читает defaultDB под локом.
@@ -134,6 +146,7 @@ func (a *app) poolHealthChecker() {
 		case <-ticker.C:
 			a.mu.Lock()
 			newPeriod := a.reconnectInterval
+			myGen := a.configGeneration
 			failed := make(map[string]DBConfig, len(a.failedPools))
 			for k, v := range a.failedPools {
 				failed[k] = v
@@ -162,7 +175,18 @@ func (a *app) poolHealthChecker() {
 					continue
 				}
 
+				// createAndPingPool мог занять несколько секунд. Если за это
+				// время reload() успел выполниться (configGeneration изменился),
+				// этот результат устарел — закрываем свежее соединение и не
+				// трогаем состояние: reload() уже разобрался с этой БД по
+				// актуальному конфигу, применение здесь только всё сломает.
 				a.mu.Lock()
+				if a.configGeneration != myGen {
+					a.mu.Unlock()
+					a.logger.Info("discarding stale reconnect result — config changed during dial", "db", name)
+					_ = db.Close()
+					continue
+				}
 				delete(a.failedPools, name)
 				a.pools[name] = &dbPool{cfg: dbCfg, db: db}
 				a.mu.Unlock()
@@ -214,6 +238,16 @@ func (a *app) reload() {
 		}
 	}
 
+	// Увеличиваем поколение конфига ДО того как buildPools начнёт открывать
+	// соединения — см. комментарий у configGeneration в типе app. Любой
+	// снэпшот poolHealthChecker, снятый раньше этой строки, теперь устарел:
+	// если checker в этот момент как раз дозванивается до какой-то БД,
+	// его результат будет отброшен при коммите, а не перезапишет то,
+	// что применит этот reload.
+	a.mu.Lock()
+	a.configGeneration++
+	a.mu.Unlock()
+
 	newPools, toClose, newFailed := a.buildPools(newCfg.Databases)
 
 	// БД, которых больше нет в конфиге вообще (не изменились, а именно удалены),
@@ -257,6 +291,15 @@ func (a *app) reload() {
 	a.defaultDB = newCfg.Settings.DefaultDB
 	a.mu.Unlock()
 
+	// reconcileWorkers ДО закрытия старых пулов, не после. reconcileWorkers
+	// гарантированно делает cancel()+wg.Wait() для каждого воркера, который
+	// использовал пул из toClose (через проверку poolChanged), прежде чем этот
+	// воркер уступает место новому. Если закрыть toClose раньше — в окне между
+	// Close() и вызовом reconcileWorkers тикер старого воркера может успеть
+	// сработать и получить "sql: database is closed" на живом, но уже
+	// закрытом соединении.
+	a.reconcileWorkers(newCfg.Queries)
+
 	for name, p := range toClose {
 		if p != nil && p.db != nil {
 			a.logger.Info("closing old pool", "db", name)
@@ -271,8 +314,6 @@ func (a *app) reload() {
 		dbPoolIdle.DeleteLabelValues(name)
 		dbPoolTotal.DeleteLabelValues(name)
 	}
-
-	a.reconcileWorkers(newCfg.Queries)
 
 	a.logger.Info("reload complete")
 }
@@ -455,11 +496,20 @@ func (a *app) reconcileWorkers(queries map[string]QueryConfig) {
 			w.wg.Wait()
 
 			if schemaChanged && w.cfg.MetricName != "" {
-				// Клоны одного файла метрик на несколько БД (cloneQueriesForDB)
-				// меняют Labels/ValueColumn синхронно в одном и том же reload —
-				// поэтому безопасно снять метрику сразу, не дожидаясь остальных
-				// клонов: они тоже увидят schemaChanged и просто не найдут метрику
-				// в кэше, getOrCreateQueryMetric создаст её заново с новой схемой.
+				// unregisterQueryMetric здесь не гарантирует что новая регистрация
+				// пройдёт успешно — Prometheus Registry.Unregister() намеренно НЕ
+				// чистит внутренний dimHashesByName ("must be consistent throughout
+				// the lifetime of a program"), поэтому Register() с ДРУГИМ набором
+				// лейблов под тем же именем метрики может продолжать падать даже
+				// после Unregister. Но без этого вызова было бы гарантированно хуже:
+				// getOrCreateQueryMetric вернул бы ЗАКЕШИРОВАННЫЙ коллектор со
+				// СТАРОЙ схемой (кэш ключуется по имени, а не по схеме), и первый
+				// же metric.With(новые_лейблы) с несовпадающим набором ключей
+				// гарантированно паникует — GaugeVec.With паникует именно там, где
+				// GetMetricWith вернул бы ошибку. Unregister заставляет
+				// getOrCreateQueryMetric пройти через Register() заново: если схема
+				// действительно несовместима — это теперь обычная ошибка запроса
+				// (см. фикс в metrics.go), а не паника всего процесса.
 				unregisterQueryMetric(w.cfg.MetricName)
 			} else if envChanged && w.cfg.MetricName != "" {
 				// Снести всю метрику нельзя (другие БД/значения env могут

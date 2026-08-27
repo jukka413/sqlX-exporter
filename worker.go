@@ -270,8 +270,21 @@ func runSingleValue(
 		return fmt.Errorf("query result is not numeric: %T", result)
 	}
 
-	metric := getOrCreateQueryMetric(name, queryCfg.Labels, nil)
-	metric.With(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil)).Set(value)
+	metric, err := getOrCreateQueryMetric(name, queryCfg.Labels, nil)
+	if err != nil {
+		return err
+	}
+	// GetMetricWith вместо With: With паникует если переданный набор лейблов
+	// не совпадает со схемой, с которой GaugeVec был создан. Такое возможно
+	// не только сразу при создании — getOrCreateQueryMetric может вернуть уже
+	// существующий закэшированный коллектор чья схема была зафиксирована
+	// раньше при других обстоятельствах. GetMetricWith в этом случае просто
+	// возвращает ошибку — как и любая другая ошибка запроса, а не крашит процесс.
+	gauge, err := metric.GetMetricWith(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil))
+	if err != nil {
+		return fmt.Errorf("label set mismatch for metric %q: %w", name, err)
+	}
+	gauge.Set(value)
 
 	logger.Info("query value", "query", name, "db", queryCfg.DB, "value", value)
 	return nil
@@ -350,7 +363,10 @@ func runMultiRow(
 		seenLabelNames[col] = struct{}{}
 	}
 
-	metric := getOrCreateQueryMetric(name, queryCfg.Labels, colLabelNames)
+	metric, err := getOrCreateQueryMetric(name, queryCfg.Labels, colLabelNames)
+	if err != nil {
+		return nil, err
+	}
 
 	// Буфер сканирования
 	scanBuf := make([]any, len(colNames))
@@ -386,7 +402,19 @@ func runMultiRow(
 		}
 
 		lbls := buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, colLabelValues)
-		metric.With(lbls).Set(value)
+		// GetMetricWith вместо With — см. подробное объяснение в runSingleValue.
+		// Здесь особенно важно: getOrCreateQueryMetric мог отдать УЖЕ
+		// существующий закэшированный коллектор, чья схема лейблов была
+		// зафиксирована в одном из предыдущих запусков ЭТОГО ЖЕ воркера —
+		// а SQL-результат мог поменять набор столбцов без единого изменения
+		// в конфиге (например поменялось определение view в БД). With() в
+		// таком случае паникует и роняет весь процесс на совершенно
+		// легитимных внешних данных.
+		gauge, err := metric.GetMetricWith(lbls)
+		if err != nil {
+			return nil, fmt.Errorf("label set mismatch for metric %q: %w", name, err)
+		}
+		gauge.Set(value)
 		currentLabels = append(currentLabels, lbls)
 	}
 

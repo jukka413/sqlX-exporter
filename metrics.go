@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 
@@ -108,19 +109,30 @@ var (
 // getOrCreateQueryMetric безопасно возвращает или создаёт GaugeVec для данного запроса.
 //
 // Лейблы формируются из трёх источников (все опциональны):
-//   - "db"          — всегда присутствует
+//   - "db", "env"   — всегда присутствуют
 //   - customLabels  — статические лейблы из поля labels: в конфиге
 //   - colLabels     — динамические лейблы из имён столбцов SELECT (для value_column режима)
 //
-// Порядок фиксируется при первом создании метрики. При hot-reload возвращается
-// существующий коллектор через AlreadyRegisteredError — паники нет.
-// См.: https://pkg.go.dev/github.com/prometheus/client_golang/prometheus#AlreadyRegisteredError
-func getOrCreateQueryMetric(queryName string, customLabels map[string]string, colLabels []string) *prometheus.GaugeVec {
+// ВАЖНО: если под этим именем метрики уже был зарегистрирован GaugeVec с ДРУГИМ
+// набором лейблов (когда-либо в этом процессе, до или после Unregister),
+// prometheus.Register() вернёт ошибку. Registry.Unregister() намеренно НЕ чистит
+// внутренний dimHashesByName — в комментарии к исходнику client_golang это
+// объясняется так: "must be consistent throughout the lifetime of a program".
+// Поэтому "снять и пересоздать" метрику с другой схемой лейблов (после смены
+// labels:/value_column: в конфиге, или при коллизии имени между двумя разными
+// файлами метрик) не работает так, как может показаться — это ограничение
+// самого client_golang, а не решаемая здесь проблема. Раньше в этом месте был
+// panic(err) на такой ошибке — один неудачно изменённый запрос ронял процесс
+// целиком и останавливал сбор метрик вообще для всех остальных запросов.
+// Теперь это обычная ошибка запроса: query_up=0, понятный лог, но остальные
+// запросы продолжают работать как ни в чём не бывало. Снимается только
+// перезапуском процесса — тогда Prometheus registry пересоздаётся с нуля.
+func getOrCreateQueryMetric(queryName string, customLabels map[string]string, colLabels []string) (*prometheus.GaugeVec, error) {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
 
 	if m, ok := queryResultMetrics[queryName]; ok {
-		return m
+		return m, nil
 	}
 
 	labelNames := buildLabelNames(customLabels, colLabels)
@@ -136,17 +148,19 @@ func getOrCreateQueryMetric(queryName string, customLabels map[string]string, co
 	if err := prometheus.Register(metric); err != nil {
 		are := &prometheus.AlreadyRegisteredError{}
 		if errors.As(err, are) {
-			existing, ok := are.ExistingCollector.(*prometheus.GaugeVec)
-			if ok {
+			if existing, ok := are.ExistingCollector.(*prometheus.GaugeVec); ok {
 				queryResultMetrics[queryName] = existing
-				return existing
+				return existing, nil
 			}
 		}
-		panic(err)
+		return nil, fmt.Errorf(
+			"metric %q: cannot register with the current label set — likely changed labels/value_column "+
+				"since first registration, or a name collision with another query; restart the process to fix: %w",
+			queryName, err)
 	}
 
 	queryResultMetrics[queryName] = metric
-	return metric
+	return metric, nil
 }
 
 // buildLabelNames возвращает упорядоченный список имён лейблов:
