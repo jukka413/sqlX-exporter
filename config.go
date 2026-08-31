@@ -140,6 +140,13 @@ type QueryConfig struct {
 	Labels      map[string]string `yaml:"labels,omitempty"`
 	ValueColumn string            `yaml:"value_column,omitempty"`
 
+	// MaxRows — лимит строк для multi-row запросов (value_column задан).
+	// Защита от unbounded cardinality: без лимита SELECT без GROUP BY/LIMIT
+	// над большой таблицей может создать миллионы time series и привести к
+	// OOM. Если не задано (0), используется defaultMaxRows (см. worker.go).
+	// Игнорируется для single-value запросов.
+	MaxRows int `yaml:"max_rows,omitempty"`
+
 	// MetricName — имя метрики в Prometheus.
 	// Заполняется автоматически при загрузке конфига — равно имени запроса.
 	// При клонировании для нескольких БД ключ воркера становится составным
@@ -534,6 +541,13 @@ func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
 		if !isValidPrometheusLabelName(label) {
 			return fmt.Sprintf("static label %q is not a valid Prometheus label name", label)
 		}
+	}
+
+	if q.MaxRows < 0 {
+		return "max_rows must not be negative"
+	}
+	if q.MaxRows > 0 && q.ValueColumn == "" {
+		return "max_rows only applies to multi-row queries (value_column must be set)"
 	}
 
 	return ""

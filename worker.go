@@ -294,8 +294,27 @@ func runSingleValue(
 // runMultiRow
 // =========================================================================
 
+// defaultMaxRows — лимит строк multi-row запроса, если max_rows не задан в
+// конфиге. Защита от непреднамеренного unbounded cardinality: SELECT без
+// GROUP BY/LIMIT над большой таблицей может вернуть миллионы строк, каждая
+// из которых становится отдельным Prometheus time series — это реальный
+// путь к OOM, который никак не лечится тюнингом GOGC/GOMEMLIMIT, потому что
+// проблема не в поведении GC, а в количестве живых объектов, которые GC
+// обязан держать живыми по прямому указанию программы.
+const defaultMaxRows = 10000
+
 // runMultiRow выполняет SELECT с несколькими строками. Каждая строка становится
 // отдельным time series в Prometheus. Столбцы кроме value_column — лейблы.
+//
+// Работает в два прохода:
+//  1. Read — читает и буферизует ВСЕ строки результата в памяти (до max_rows).
+//     Если строк больше лимита — прерывается сразу с ошибкой, НЕ трогая
+//     Prometheus вообще: частично прочитанный или переполненный результат
+//     не должен попасть в метрики частично, иначе после failed запроса
+//     на графиках останется случайный обрубок данных.
+//  2. Commit — только после того как ВЕСЬ результат успешно прочитан и
+//     находится в пределах лимита, записывает буфер в Prometheus и удаляет
+//     устаревшие (пропавшие) строки через reconciliation по prevLabels.
 //
 // Reconciliation: сравниваем текущий набор лейблов с prevLabels.
 // Строки, которые были в прошлом запуске но отсутствуют в текущем — удаляются из метрики.
@@ -363,22 +382,33 @@ func runMultiRow(
 		seenLabelNames[col] = struct{}{}
 	}
 
-	metric, err := getOrCreateQueryMetric(name, queryCfg.Labels, colLabelNames)
-	if err != nil {
-		return nil, err
+	maxRows := queryCfg.MaxRows
+	if maxRows <= 0 {
+		maxRows = defaultMaxRows
 	}
 
-	// Буфер сканирования
+	// --- Фаза 1: Read — буферизуем в памяти, ничего не пишем в Prometheus ---
+
 	scanBuf := make([]any, len(colNames))
 	scanPtrs := make([]any, len(colNames))
 	for i := range scanBuf {
 		scanPtrs[i] = &scanBuf[i]
 	}
 
-	// currentLabels — набор лейблов текущего запуска, для reconciliation
-	var currentLabels []prometheus.Labels
+	type bufferedRow struct {
+		labels prometheus.Labels
+		value  float64
+	}
+	buffered := make([]bufferedRow, 0, 64)
 
 	for rows.Next() {
+		if len(buffered) >= maxRows {
+			return nil, fmt.Errorf(
+				"query returned more than max_rows=%d rows — aborting to avoid unbounded metric cardinality; "+
+					"add GROUP BY/LIMIT to the SQL or raise max_rows explicitly if this is expected",
+				maxRows)
+		}
+
 		if err := rows.Scan(scanPtrs...); err != nil {
 			return nil, err
 		}
@@ -402,28 +432,45 @@ func runMultiRow(
 		}
 
 		lbls := buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, colLabelValues)
-		// GetMetricWith вместо With — см. подробное объяснение в runSingleValue.
-		// Здесь особенно важно: getOrCreateQueryMetric мог отдать УЖЕ
-		// существующий закэшированный коллектор, чья схема лейблов была
-		// зафиксирована в одном из предыдущих запусков ЭТОГО ЖЕ воркера —
-		// а SQL-результат мог поменять набор столбцов без единого изменения
-		// в конфиге (например поменялось определение view в БД). With() в
-		// таком случае паникует и роняет весь процесс на совершенно
-		// легитимных внешних данных.
-		gauge, err := metric.GetMetricWith(lbls)
-		if err != nil {
-			return nil, fmt.Errorf("label set mismatch for metric %q: %w", name, err)
-		}
-		gauge.Set(value)
-		currentLabels = append(currentLabels, lbls)
+		buffered = append(buffered, bufferedRow{labels: lbls, value: value})
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	if len(currentLabels) == 0 {
+	if len(buffered) == 0 {
 		logger.Warn("query returned 0 rows", "query", name, "db", queryCfg.DB)
+	}
+
+	// --- Фаза 2: Commit — весь результат успешно прочитан и в пределах лимита ---
+
+	metric, err := getOrCreateQueryMetric(name, queryCfg.Labels, colLabelNames)
+	if err != nil {
+		return nil, err
+	}
+
+	// Сначала резолвим ВСЕ gauge-хендлы через GetMetricWith (не паникующий With),
+	// и только если ВСЕ строки успешно резолвились — делаем Set(). Если бы мы
+	// делали Set() сразу в цикле резолва, ошибка на середине результата
+	// (например схема лейблов несовместима с уже закэшированным коллектором)
+	// оставила бы половину строк записанными, а половину — нет, то есть тот
+	// же partial-write эффект который мы и убираем этим редизайном.
+	gauges := make([]prometheus.Gauge, len(buffered))
+	for i, row := range buffered {
+		g, err := metric.GetMetricWith(row.labels)
+		if err != nil {
+			return nil, fmt.Errorf("label set mismatch for metric %q: %w", name, err)
+		}
+		gauges[i] = g
+	}
+	for i, row := range buffered {
+		gauges[i].Set(row.value)
+	}
+
+	currentLabels := make([]prometheus.Labels, len(buffered))
+	for i, row := range buffered {
+		currentLabels[i] = row.labels
 	}
 
 	// Reconciliation: удаляем строки которые были в прошлом запуске но исчезли сейчас.
