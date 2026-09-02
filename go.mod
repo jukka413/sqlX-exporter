@@ -6,7 +6,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/prometheus/client_golang v1.23.2
-	github.com/sijms/go-ora/v2 v2.9.0
+	github.com/sijms/go-ora/v2 v2.8.24
 	gopkg.in/yaml.v3 v3.0.1
 )
 

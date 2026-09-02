@@ -15,18 +15,25 @@ import (
 //
 //	kubelet обновляет файлы через AtomicWriter: создаёт новую директорию,
 //	записывает файлы, атомарно переключает симлинк ..data → новая директория,
-//	удаляет старую. В результате inotify получает IN_DELETE_SELF (Remove/Rename),
-//	а не IN_MODIFY/IN_CLOSE_WRITE как при обычном обновлении файла.
-//	Кроме того, после Remove inotify watch ломается и нужно переподписываться.
+//	удаляет старую. В результате inotify получает событие на ..data внутри
+//	отслеживаемой директории (Remove/Rename), а не IN_MODIFY/IN_CLOSE_WRITE
+//	как при обычном обновлении файла.
 //	Источник: https://ahmet.im/blog/kubernetes-inotify/
+//
+//	Важно: мы следим за ДИРЕКТОРИЕЙ, а не за отдельным файлом/симлинком.
+//	IN_DELETE_SELF/IN_MOVE_SELF (события которые ломают watch) срабатывают
+//	только когда удаляют/переименовывают САМ отслеживаемый объект — то есть
+//	директорию целиком. Удаление или переименование файла ВНУТРИ отслеживаемой
+//	директории (в том числе симлинка ..data) — это обычное дочернее событие,
+//	watch на директорию от него не ломается и переподписываться не нужно.
+//	См. inotify(7) и https://pkg.go.dev/github.com/fsnotify/fsnotify.
 //
 // Поведение вне Kubernetes (обычная ФС, vim, nano и др.):
 //
 //	Редакторы часто пишут через временный файл + rename → приходит Create.
 //	Прямая запись → приходит Write.
 //
-// Решение: следим за ДИРЕКТОРИЕЙ (не файлом), реагируем на Write/Create/Remove/Rename,
-// при Remove/Rename переподписываемся на директорию.
+// Решение: следим за ДИРЕКТОРИЕЙ (не файлом), реагируем на Write/Create/Remove/Rename.
 // Debounce 150ms защищает от burst-событий.
 // watchConfig следит за основным конфигом и директориями инклюд-файлов.
 // extraDirs — дополнительные директории для наблюдения (из includes в конфиге).
@@ -39,12 +46,18 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 	}
 	defer watcher.Close()
 
-	dir := filepath.Dir(path)
+	// absPath вычисляется ДО того как из него берётся директория — иначе при
+	// запуске с относительным путём (--config ./config.yaml, дефолт в main.go)
+	// dir получался бы относительным ("."), а eventDir при событиях всегда
+	// абсолютный — они бы никогда не совпадали, и главная директория конфига
+	// фактически не отслеживалась бы в watchedDirs.
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		logger.Error("failed to resolve config path", "error", err)
 		return
 	}
+	absPath = filepath.Clean(absPath)
+	dir := filepath.Dir(absPath)
 
 	if err := watcher.Add(dir); err != nil {
 		logger.Error("failed to watch config directory", "dir", dir, "error", err)
@@ -59,6 +72,7 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 		if err != nil {
 			continue
 		}
+		absDir = filepath.Clean(absDir)
 		if _, already := watchedDirs[absDir]; already {
 			continue
 		}
@@ -96,37 +110,44 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 				return
 			}
 
-			// Фильтруем по имени файла — реагируем только на наш конфиг.
-			// В k8s события приходят на файлы внутри директории (..data, symlinks).
-			// Проверяем и прямое совпадение пути и совпадение базового имени —
-			// потому что в k8s реальный путь может быть вида:
-			// /etc/sqlx-exporter/..2024_04_24_12_00_00.123456789/config.yaml
-			eventAbs, _ := filepath.Abs(event.Name)
-			matchesDirect := eventAbs == absPath
-			matchesName := filepath.Base(event.Name) == filepath.Base(absPath)
-			// ..data — специальный симлинк который kubelet переключает атомарно
-			isDataSymlink := filepath.Base(event.Name) == "..data"
+			eventAbs, err := filepath.Abs(event.Name)
+			if err != nil {
+				continue
+			}
+			eventAbs = filepath.Clean(eventAbs)
 
-			if !matchesDirect && !matchesName && !isDataSymlink {
+			// Сравниваем только по полному абсолютному пути — сравнение по
+			// одному basename (как было раньше) могло ложно совпасть с
+			// одноимённым файлом в другой отслеживаемой директории.
+			isMainConfig := eventAbs == absPath
+			// ..data — специальный симлинк который kubelet переключает атомарно
+			// при обновлении ЛЮБОГО файла в ConfigMap. Реагируем всегда.
+			isDataSymlink := filepath.Base(eventAbs) == "..data"
+			// Инклюд-файлы лежат в watchedDirs под своими собственными именами
+			// (oracle-metrics.yaml и т.п.), не совпадающими с basename основного
+			// конфига — без этой проверки их изменения тихо игнорировались бы
+			// и hot-reload для инклюдов не работал бы вообще.
+			isYAMLInWatchedDir := func() bool {
+				ext := filepath.Ext(eventAbs)
+				if ext != ".yaml" && ext != ".yml" {
+					return false
+				}
+				_, watched := watchedDirs[filepath.Dir(eventAbs)]
+				return watched
+			}()
+
+			if !isMainConfig && !isDataSymlink && !isYAMLInWatchedDir {
 				continue
 			}
 
-			logger.Debug("watcher event", "op", event.Op, "file", event.Name)
+			logger.Debug("watcher event", "op", event.Op, "file", eventAbs)
 
-			switch {
-			case event.Has(fsnotify.Write) || event.Has(fsnotify.Create):
-				// Обычная ФС: прямая запись или atomic rename редактора
-				triggerReload()
-
-			case event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename):
-				// Kubernetes AtomicWriter: симлинк переключился → файл "удалён".
-				// Watch на директорию после Remove не ломается (в отличие от watch на файл),
-				// но переподписываемся на случай если директория была пересоздана.
-				_ = watcher.Remove(dir)
-				if err := watcher.Add(dir); err != nil {
-					logger.Error("failed to re-watch config directory after remove",
-						"dir", dir, "error", err)
-				}
+			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) ||
+				event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
+				// Никакого Remove/Add директории здесь не требуется — мы следим
+				// за директорией, а не за файлом внутри неё, а watch на директорию
+				// не ломается от Remove/Rename её содержимого (см. комментарий
+				// в начале функции).
 				triggerReload()
 			}
 
