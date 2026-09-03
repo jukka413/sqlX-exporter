@@ -47,6 +47,17 @@ var (
 		[]string{"db"},
 	)
 
+	// configIncludeFailures — сколько инклюдов не удалось загрузить при
+	// последнем reload (файл не найден, битый YAML). Начиная с фикса,
+	// такая ошибка не блокирует остальной конфиг — но это значит что
+	// проблема больше не видна из самого факта "reload complete" в логах.
+	// Алерт на эту метрику даёт то же самое, что раньше давал упавший
+	// reload, но не жертвуя устойчивостью остального конфига.
+	configIncludeFailures = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "app_config_include_failures",
+		Help: "Number of includes that failed to load during the last config reload",
+	})
+
 	queryDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "app_query_duration_seconds",
@@ -87,6 +98,7 @@ func init() {
 		queryUp,
 		queryLastSuccess,
 		dbConnectionErrors,
+		configIncludeFailures,
 		queryDuration,
 		dbPoolAcquired,
 		dbPoolIdle,

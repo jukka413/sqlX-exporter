@@ -145,6 +145,15 @@ func (a *app) reload() {
 	for _, reason := range newCfg.overwritten {
 		a.logger.Warn("config key overwritten by a later include", "detail", reason)
 	}
+	// Сломанный инклюд (файл не найден, битый YAML) больше не блокирует
+	// весь reload — только тот конкретный файл. Явно проговариваем это в
+	// сообщении, иначе легко решить что раз "reload complete" ниже —
+	// значит применилось вообще всё, включая содержимое этого файла.
+	for _, reason := range newCfg.failedIncludes {
+		a.logger.Error("include failed to load — its databases/queries are missing from this config, "+
+			"the rest of the config was still applied normally", "detail", reason)
+	}
+	configIncludeFailures.Set(float64(len(newCfg.failedIncludes)))
 
 	if err := validateDatabasesAndSettings(newCfg); err != nil {
 		a.logger.Error("invalid config", "error", err)

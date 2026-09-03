@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -70,6 +69,15 @@ type Config struct {
 	// проходит абсолютно молча — метрика продолжает существовать под тем же
 	// именем, но начинает собирать данные с другой БД или по другому SQL.
 	overwritten []string `yaml:"-"`
+
+	// failedIncludes — список инклюдов, которые не удалось загрузить (файл
+	// не найден, битый YAML и т.п.). Не из YAML — заполняется кодом, для
+	// логирования в app.go. Раньше такая ошибка была фатальной для ВСЕГО
+	// reload() — один сломанный инклюд блокировал применение изменений даже
+	// в файлах, никак с ним не связанных. Теперь конкретно этот инклюд
+	// пропускается (его databases/queries просто отсутствуют в итоговом
+	// конфиге), а все остальные файлы применяются как обычно.
+	failedIncludes []string `yaml:"-"`
 }
 
 // IncludeDefault поддерживает как строку так и список строк в YAML:
@@ -305,7 +313,25 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 			for _, db := range dbs {
 				inc, err := loadConfigWithContext(fullPath, depth+1, db, effectiveIncludeDefaults, rootDir)
 				if err != nil {
-					return cfg, fmt.Errorf("include %q (db=%s): %w", fullPath, db, err)
+					// Раньше ошибка ЛЮБОГО инклюда (файл не найден, битый YAML)
+					// прерывала всю loadConfigWithContext — а значит и весь
+					// reload() целиком, включая совершенно не связанные с этим
+					// инклюдом файлы и метрики. На практике это выглядело так:
+					// один сломанный include-файл незаметно блокировал
+					// обновление ВСЕХ остальных метрик — при hot-reload
+					// оставалось работать старое состояние целиком, а при
+					// первом запуске процесса (после пересоздания Pod'а, когда
+					// откатываться ещё не на что) не работало вообще ничего.
+					// В логах при этом была только ошибка про один конкретный
+					// файл, что не объясняло, почему не обновились остальные.
+					//
+					// Теперь ошибка одного инклюда не мешает остальным —
+					// логируем и переходим к следующему, как уже делаем для
+					// query без записи в include_defaults (skippedIncludes)
+					// и для невалидных отдельных запросов (sanitizeQueries).
+					cfg.failedIncludes = append(cfg.failedIncludes,
+						fmt.Sprintf("%q (db=%s): %v", fullPath, db, err))
+					continue
 				}
 				if addSuffix {
 					inc = cloneQueriesForDB(inc, db)
@@ -315,6 +341,7 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 				cfg.skippedIncludes = append(cfg.skippedIncludes, inc.skippedIncludes...)
 				cfg.missingEnvVars = append(cfg.missingEnvVars, inc.missingEnvVars...)
 				cfg.overwritten = append(cfg.overwritten, inc.overwritten...)
+				cfg.failedIncludes = append(cfg.failedIncludes, inc.failedIncludes...)
 			}
 		}
 		cfg.Includes = nil
@@ -351,11 +378,10 @@ func applyDefaultDB(cfg *Config, defaultDB string) {
 
 // expandURLs подставляет переменные окружения только в поля url баз данных.
 //
-// Значения по умолчанию URL-кодируются чтобы спецсимволы в паролях
-// (@ / + # % & : = пробел и др.) не ломали парсинг URL. Используется
-// url.QueryEscape, так как он кодирует более широкий набор символов чем
-// url.PathEscape (в частности "=", который PathEscape сознательно
-// пропускает как разрешённый в path-сегменте по RFC 3986).
+// Кодирование значения зависит от драйвера (см. тело функции):
+//   - MySQL — не кодируется вообще, его DSN не является URL;
+//   - TNS-дескрипторы Oracle — не кодируются, иначе ломается их грамматика;
+//   - остальное — percent-кодирование через escapeURLComponent.
 //
 // Исключение — значения похожие на TNS-дескриптор Oracle:
 // "(DESCRIPTION=(ADDRESS=...)...)" — такие значения НЕ кодируются,
@@ -381,6 +407,16 @@ func expandURLs(cfg *Config) (missingVars []string) {
 	seen := make(map[string]struct{})
 
 	for name, db := range cfg.Databases {
+		// MySQL DSN — не URL: его грамматика "user:pass@tcp(host:port)/db"
+		// разбирается собственным парсером драйвера, который берёт пароль
+		// как есть, между первым ':' и последним '@'. Официальная документация
+		// go-sql-driver/mysql прямо говорит: "Passwords can consist of any
+		// character. Escaping is not necessary", а Config.FormatDSN пишет
+		// пароль в строку дословно. Любое percent-кодирование здесь не
+		// раскодируется никем и уходит в MySQL КАК ЧАСТЬ ПАРОЛЯ — то есть
+		// пароль "p@ss" превращался в "p%40ss" и аутентификация падала.
+		isMySQL := strings.EqualFold(strings.TrimSpace(db.Driver), "mysql")
+
 		db.URL = os.Expand(db.URL, func(key string) string {
 			val, ok := os.LookupEnv(key)
 			if !ok {
@@ -399,12 +435,48 @@ func expandURLs(cfg *Config) (missingVars []string) {
 			if looksLikeTNSDescriptor(val) {
 				return val // подставляем как есть, без кодирования
 			}
-			return url.QueryEscape(val)
+			if isMySQL {
+				return val // см. комментарий выше — MySQL DSN не URL
+			}
+			return escapeURLComponent(val)
 		})
 		cfg.Databases[name] = db
 	}
 
 	return missingVars
+}
+
+// escapeURLComponent percent-кодирует всё, кроме unreserved-символов RFC 3986
+// (ALPHA / DIGIT / "-" / "." / "_" / "~").
+//
+// Используется вместо url.QueryEscape, который предназначен для query-компонента
+// URL и кодирует пробел как "+". В userinfo (user:password@host) "+" — это
+// обычный литеральный символ, а не пробел, поэтому пароль с пробелом через
+// QueryEscape приезжал бы в БД с "+" вместо пробела.
+//
+// url.PathEscape тоже не подходит: он намеренно оставляет незакодированными
+// ряд sub-delims (включая "=" и "&"), что ломало разбор userinfo для паролей
+// с этими символами.
+//
+// Кодировать строго всё, кроме unreserved — заведомо безопасно: любой
+// стандартный декодер (url.Parse для userinfo, url.PathUnescape в TNS-пути)
+// корректно раскодирует %XX обратно, а "перекодирование" безвредно.
+func escapeURLComponent(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		unreserved := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~'
+		if unreserved {
+			b.WriteByte(c)
+			continue
+		}
+		const hex = "0123456789ABCDEF"
+		b.WriteByte('%')
+		b.WriteByte(hex[c>>4])
+		b.WriteByte(hex[c&0x0F])
+	}
+	return b.String()
 }
 
 // looksLikeTNSDescriptor определяет похоже ли значение на TNS-дескриптор Oracle.
@@ -497,6 +569,9 @@ func sanitizeQueries(cfg *Config) []string {
 // validateSingleQuery проверяет один запрос и возвращает причину невалидности
 // (пустая строка — запрос валиден).
 func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
+	if strings.TrimSpace(q.SQL) == "" {
+		return "sql is required"
+	}
 	if q.DB == "" && cfg.Settings.DefaultDB == "" {
 		return "db is required (or set default_db / settings.default_db)"
 	}
@@ -600,6 +675,17 @@ func isValidPrometheusLabelName(name string) bool {
 // validateDatabasesAndSettings проверяет критичные части конфига —
 // настройки и описания БД. Ошибки здесь валят весь reload, так как
 // означают структурно сломанный конфиг (а не опечатку в одном запросе).
+// supportedDrivers — драйверы, реально зарегистрированные импортами в
+// drivers.go. Держать этот список в синхроне с drivers.go: значение здесь
+// должно совпадать со строкой, под которой драйвер регистрируется в
+// database/sql.
+var supportedDrivers = map[string]bool{
+	"mysql":     true,
+	"oracle":    true,
+	"pgx":       true,
+	"sqlserver": true,
+}
+
 func validateDatabasesAndSettings(cfg Config) error {
 	if cfg.Settings.DBReconnectInterval != "" {
 		d, err := time.ParseDuration(cfg.Settings.DBReconnectInterval)
@@ -620,8 +706,26 @@ func validateDatabasesAndSettings(cfg Config) error {
 		if db.Driver == "" {
 			return fmt.Errorf("database %q: driver is required", name)
 		}
+		// Allowlist драйверов. Без него опечатка ("postgres" вместо "pgx")
+		// проходит валидацию конфига и превращается в бесконечный цикл
+		// неудачных reconnect-попыток в рантайме, без внятного объяснения
+		// причины. Список должен совпадать с тем, что реально
+		// зарегистрировано импортами в drivers.go.
+		if !supportedDrivers[strings.ToLower(strings.TrimSpace(db.Driver))] {
+			return fmt.Errorf("database %q: unknown driver %q (supported: mysql, oracle, pgx, sqlserver)",
+				name, db.Driver)
+		}
 		if db.URL == "" {
 			return fmt.Errorf("database %q: url is required", name)
+		}
+		// Отрицательные значения в database/sql означают "без ограничений"
+		// (для MaxOpenConns) — опечатка вида max_conns: -1 незаметно снимала
+		// бы лимит вместо того чтобы его задать.
+		if db.MaxConns < 0 {
+			return fmt.Errorf("database %q: max_conns must not be negative", name)
+		}
+		if db.MaxIdleConns < 0 {
+			return fmt.Errorf("database %q: max_idle_conns must not be negative", name)
 		}
 		if db.MaxIdleConns > 0 && db.MaxConns > 0 && db.MaxIdleConns > db.MaxConns {
 			return fmt.Errorf("database %q: max_idle_conns (%d) must be <= max_conns (%d)",
