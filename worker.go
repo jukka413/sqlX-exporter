@@ -264,9 +264,15 @@ func runSingleValue(
 
 	value, ok := toFloat64(result)
 	if !ok {
-		// Раньше здесь был return nil — runOnce считал такой запуск успешным
-		// и выставлял queryUp=1 / queryLastSuccess несмотря на то что метрика
-		// фактически не обновилась. Теперь это настоящая ошибка запроса.
+		// Раньше return nil здесь тоже НЕ удалял старую строку — так же как
+		// не выставлял queryUp=0 (см. фикс ниже про numeric). Расхождение с
+		// путём ошибки Scan() (который строку удаляет) означало что
+		// app_query_up=0, а бизнес-метрика молча оставалась со старым
+		// значением — вводящее в заблуждение расхождение состояний.
+		metric, exists := lookupQueryMetric(name)
+		if exists {
+			metric.Delete(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil))
+		}
 		return fmt.Errorf("query result is not numeric: %T", result)
 	}
 
@@ -401,8 +407,18 @@ func runMultiRow(
 	}
 	buffered := make([]bufferedRow, 0, 64)
 
+	// rowsRead считает КАЖДУЮ прочитанную строку, а не только те что успешно
+	// распарсились в число. Раньше лимит проверялся через len(buffered), который
+	// растёт только при удачном toFloat64 — запрос возвращающий миллионы строк
+	// с нечисловым value_column проходил бы этот лимит насквозь: len(buffered)
+	// оставался бы 0 сколько бы строк ни было прочитано. rowsRead считает то,
+	// что реально прошло через rows.Next(), независимо от того распарсилось ли
+	// значение — это и есть защита от runaway query, а не от runaway metric count.
+	rowsRead := 0
+
 	for rows.Next() {
-		if len(buffered) >= maxRows {
+		rowsRead++
+		if rowsRead > maxRows {
 			return nil, fmt.Errorf(
 				"query returned more than max_rows=%d rows — aborting to avoid unbounded metric cardinality; "+
 					"add GROUP BY/LIMIT to the SQL or raise max_rows explicitly if this is expected",

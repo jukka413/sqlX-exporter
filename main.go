@@ -26,17 +26,7 @@ func main() {
 	appCtx, appCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer appCancel()
 
-	a := &app{
-		logger:            logger,
-		ctx:               appCtx,
-		cancel:            appCancel,
-		configPath:        *configPath,
-		workers:           make(map[string]*worker),
-		pools:             make(map[string]*dbPool),
-		failedPools:       make(map[string]DBConfig),
-		queriesCfg:        make(map[string]QueryConfig),
-		reconnectInterval: 5 * time.Minute, // дефолт до первого reload
-	}
+	a := newApp(appCtx, appCancel, logger, *configPath)
 
 	// ---- Metrics server ----
 	mux := http.NewServeMux()
@@ -56,7 +46,7 @@ func main() {
 	}()
 
 	// ---- Pool metrics updater ----
-	go a.poolMetricsUpdater(5 * time.Second)
+	go a.pm.metricsUpdater(5 * time.Second)
 
 	// ---- Pool health checker — переподключение к упавшим БД ----
 	go a.poolHealthChecker()

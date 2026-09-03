@@ -41,24 +41,44 @@ func validateSchedule(s *ScheduleConfig) error {
 }
 
 // sameQueryConfig сравнивает две версии конфига запроса чтобы решить нужен ли
-// рестарт воркера. Обязательно сравнивает Labels и ValueColumn — это те поля
-// которые определяют схему лейблов Prometheus-метрики (GaugeVec). Если они
-// изменились, а рестарта не произойдёт, следующий вызов metric.With(labels)
-// получит набор лейблов, не совпадающий с тем что было при создании GaugeVec,
-// и запаникует (GaugeVec.With паникует там, где GetMetricWith вернул бы ошибку).
+// рестарт воркера. MaxRows включён в сравнение — без него смена лимита строк
+// в конфиге не подхватывалась бы на лету, воркер продолжал бы использовать
+// значение, скопированное в QueryConfig при своём последнем старте.
 func sameQueryConfig(a, b QueryConfig) bool {
 	return a.DB == b.DB &&
 		a.SQL == b.SQL &&
 		a.Timeout == b.Timeout &&
 		a.Interval == b.Interval &&
 		a.ValueColumn == b.ValueColumn &&
-		sameLabels(a.Labels, b.Labels) &&
+		a.MaxRows == b.MaxRows &&
+		sameLabelKeys(a.Labels, b.Labels) &&
+		sameLabelValues(a.Labels, b.Labels) &&
 		sameSchedule(a.Schedule, b.Schedule)
 }
 
-// sameLabels сравнивает две карты статических лейблов. nil и пустая карта
-// считаются равными — обе означают "лейблов нет".
-func sameLabels(a, b map[string]string) bool {
+// sameLabelKeys сравнивает только НАЗВАНИЯ статических лейблов — это то, что
+// определяет схему лейблов Prometheus-метрики (GaugeVec). Если labels.cluster
+// был и остался, а изменилось только его значение (prod-a → prod-b) — схема
+// не изменилась, изменилась только identity конкретной time series.
+// Раньше это не разделялось: смена ЗНАЧЕНИЯ лейбла ошибочно считалась
+// сменой схемы и приводила к полному unregister метрики.
+func sameLabelKeys(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// sameLabelValues сравнивает значения статических лейблов (предполагая что
+// набор ключей уже одинаков — это отдельно проверяет sameLabelKeys).
+// Отвечает на вопрос "изменилась ли identity time series", а не "изменилась
+// ли схема метрики".
+func sameLabelValues(a, b map[string]string) bool {
 	if len(a) != len(b) {
 		return false
 	}
