@@ -58,6 +58,48 @@ var (
 		Help: "Number of includes that failed to load during the last config reload",
 	})
 
+	// configReloadTotal — счётчик попыток reload по результату. Позволяет
+	// алертить на "reload постоянно фейлится" (rate(...{result!="success"}[5m]) > 0)
+	// без разбора логов.
+	configReloadTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "app_config_reload_total",
+			Help: "Total number of config reload attempts by result",
+		},
+		// result: "success" | "load_error" | "invalid_config"
+		[]string{"result"},
+	)
+
+	// configLastReloadTimestamp — время последней ПОПЫТКИ reload, вне
+	// зависимости от результата. Если эта метрика перестала расти —
+	// watcher/reload-цикл завис, что само по себе достаточно серьёзно чтобы
+	// быть видимым отдельно от успешности содержимого конфига.
+	configLastReloadTimestamp = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "app_config_last_reload_timestamp_seconds",
+		Help: "Unix timestamp of the last config reload attempt, regardless of outcome",
+	})
+
+	// configLastSuccessTimestamp — время последнего УСПЕШНОГО reload.
+	// Вместе с configLastReloadTimestamp разница между ними показывает
+	// сколько времени конфиг не может примениться.
+	configLastSuccessTimestamp = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "app_config_last_reload_success_timestamp_seconds",
+		Help: "Unix timestamp of the last successful config reload",
+	})
+
+	// dbUp — состояние подключения к каждой сконфигурированной БД: 1 если
+	// пул сейчас рабочий, 0 если БД в failedPools. В отличие от
+	// app_query_up (которого может не быть вообще, если ни один воркер для
+	// этой БД так и не стартовал), dbUp существует для каждой БД из
+	// конфига всегда, независимо от того, есть ли у нее хоть один запрос.
+	dbUp = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "app_db_up",
+			Help: "1 if the database currently has a working connection pool, 0 if it is failing to connect",
+		},
+		[]string{"db"},
+	)
+
 	queryDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "app_query_duration_seconds",
@@ -99,6 +141,10 @@ func init() {
 		queryLastSuccess,
 		dbConnectionErrors,
 		configIncludeFailures,
+		configReloadTotal,
+		configLastReloadTimestamp,
+		configLastSuccessTimestamp,
+		dbUp,
 		queryDuration,
 		dbPoolAcquired,
 		dbPoolIdle,

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -40,6 +41,16 @@ type app struct {
 	// outage одной БД штатно переживается архитектурой (см. failedPools),
 	// и не должен выталкивать здоровый Pod из Service.
 	configReady bool
+
+	// watchDirsCh передаёт watcher'у актуальный список директорий для
+	// отслеживания после каждого успешного reload. Раньше этот список
+	// собирался ОДИН раз при старте процесса (main.collectIncludeDirs) —
+	// новый инклюд, добавленный через hot-reload в директорию, которая ещё
+	// не отслеживалась, был не виден watcher'у до рестарта Pod'а. Каждое
+	// значение в канале — ПОЛНЫЙ снимок нужных директорий, не дельта,
+	// поэтому пропуск промежуточного обновления (см. publishWatchDirs)
+	// ничего не портит — следующий reload пришлёт уже актуальный полный список.
+	watchDirsCh chan []string
 }
 
 func newApp(ctx context.Context, cancel context.CancelFunc, logger *slog.Logger, configPath string) *app {
@@ -51,7 +62,36 @@ func newApp(ctx context.Context, cancel context.CancelFunc, logger *slog.Logger,
 		pm:                newPoolManager(ctx, logger),
 		wm:                newWorkerManager(ctx, logger),
 		reconnectInterval: 5 * time.Minute, // дефолт до первого reload
+		watchDirsCh:       make(chan []string, 1),
 	}
+}
+
+// publishWatchDirs передаёт watcher'у свежий список директорий, не блокируясь.
+// Если предыдущее значение ещё не было прочитано — заменяет его (каждое
+// значение самодостаточный полный снимок, промежуточные версии не нужны).
+func (a *app) publishWatchDirs(dirs []string) {
+	select {
+	case <-a.watchDirsCh:
+	default:
+	}
+	select {
+	case a.watchDirsCh <- dirs:
+	default:
+	}
+}
+
+// uniqueDirs возвращает уникальные директории для списка абсолютных путей файлов.
+func uniqueDirs(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	var dirs []string
+	for _, p := range paths {
+		d := filepath.Dir(p)
+		if _, ok := seen[d]; !ok {
+			seen[d] = struct{}{}
+			dirs = append(dirs, d)
+		}
+	}
+	return dirs
 }
 
 func (a *app) getDefaultDB() string {
@@ -122,6 +162,7 @@ func (a *app) poolHealthChecker() {
 				}
 
 				a.logger.Info("db reconnected", "db", name)
+				a.pm.updateDBUpMetrics()
 
 				a.wm.reconcile(queries, a.pm.snapshotPools(), a.getDefaultDB())
 
@@ -145,12 +186,16 @@ func (a *app) reload() {
 	defer a.reloadMu.Unlock()
 
 	a.logger.Info("reloading configuration")
+	configLastReloadTimestamp.SetToCurrentTime()
 
 	newCfg, err := loadConfig(a.configPath)
 	if err != nil {
 		a.logger.Error("failed to load config", "error", err)
+		configReloadTotal.WithLabelValues("load_error").Inc()
 		return
 	}
+
+	a.publishWatchDirs(uniqueDirs(newCfg.dependencies))
 
 	for _, reason := range newCfg.skippedIncludes {
 		a.logger.Info("include skipped (no include_defaults entry)", "detail", reason)
@@ -175,6 +220,7 @@ func (a *app) reload() {
 
 	if err := validateDatabasesAndSettings(newCfg); err != nil {
 		a.logger.Error("invalid config", "error", err)
+		configReloadTotal.WithLabelValues("invalid_config").Inc()
 		return
 	}
 
@@ -203,6 +249,9 @@ func (a *app) reload() {
 
 	a.pm.closePools(toClose)
 	a.pm.deletePoolMetrics(removedDBs)
+
+	configReloadTotal.WithLabelValues("success").Inc()
+	configLastSuccessTimestamp.SetToCurrentTime()
 
 	a.logger.Info("reload complete")
 }

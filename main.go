@@ -8,13 +8,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gopkg.in/yaml.v3"
 )
 
 func main() {
@@ -85,11 +83,11 @@ func main() {
 	// ---- Pool health checker — переподключение к упавшим БД ----
 	go a.poolHealthChecker()
 
-	// First load
+	// First load — уже публикует директории для watcher через a.watchDirsCh
+	// (см. app.reload). Отдельный сбор директорий здесь больше не нужен —
+	// это единственный механизм и для первого запуска, и для всех
+	// последующих hot-reload.
 	a.reload()
-
-	// Собираем директории инклюд-файлов для watcher
-	includeDirs := collectIncludeDirs(a.configPath)
 
 	// FSNotify watcher. watcherDone закрывается когда watchConfig
 	// действительно вернулся — то есть больше НИКОГДА не вызовет reload().
@@ -101,7 +99,7 @@ func main() {
 	watcherWG.Add(1)
 	go func() {
 		defer watcherWG.Done()
-		watchConfig(a.ctx, a.logger, a.configPath, a.reload, includeDirs...)
+		watchConfig(a.ctx, a.logger, a.configPath, a.reload, a.watchDirsCh)
 	}()
 
 	exitCode := 0
@@ -135,40 +133,4 @@ func main() {
 
 	logger.Info("application stopped gracefully")
 	os.Exit(exitCode)
-}
-
-// collectIncludeDirs читает конфиг и возвращает директории всех инклюд-файлов
-// для настройки watcher. Читает файл напрямую (не через loadConfig), потому что
-// loadConfig очищает cfg.Includes после обработки инклюдов — этот срез
-// был бы уже пустым на момент возврата.
-//
-// Примечание: собирает только инклюды основного файла, не рекурсивные
-// инклюды внутри инклюдов. На практике все файлы обычно лежат в одной
-// директории ConfigMap, так что этого достаточно.
-func collectIncludeDirs(configPath string) []string {
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil
-	}
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil
-	}
-	if len(cfg.Includes) == 0 {
-		return nil
-	}
-	baseDir := filepath.Dir(configPath)
-	seen := map[string]struct{}{}
-	var dirs []string
-	for inc, enabled := range cfg.Includes {
-		if !enabled {
-			continue
-		}
-		dir := filepath.Dir(filepath.Join(baseDir, inc))
-		if _, ok := seen[dir]; !ok {
-			seen[dir] = struct{}{}
-			dirs = append(dirs, dir)
-		}
-	}
-	return dirs
 }

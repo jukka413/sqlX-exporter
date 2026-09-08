@@ -43,13 +43,26 @@ import (
 // момент отмены ctx, цикл select не увидит ctx.Done() пока reload() не
 // вернётся — таймер и ctx.Done() физически не могут обрабатываться
 // одновременно в этом однопоточном цикле.
-func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func(), extraDirs ...string) {
+//
+// updateDirs — канал, по которому вызывающий (app.reload) присылает
+// АКТУАЛЬНЫЙ ПОЛНЫЙ список директорий для отслеживания после каждого
+// успешного парсинга конфига. Раньше этот список собирался один раз при
+// старте процесса — новый инклюд, добавленный через hot-reload в директорию,
+// которая ещё не отслеживалась, был не виден watcher'у до рестарта Pod'а.
+// Директории только добавляются, никогда не убираются — лишний watch на
+// более не нужную директорию безвреден (события из неё просто не пройдут
+// фильтр isYAMLInWatchedDir по конкретным файлам).
+func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func(), updateDirs <-chan []string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		logger.Error("failed to create watcher", "error", err)
 		return
 	}
-	defer watcher.Close()
+	defer func() {
+		if err := watcher.Close(); err != nil {
+			logger.Warn("failed to close fsnotify watcher", "error", err)
+		}
+	}()
 
 	// absPath вычисляется ДО того как из него берётся директория — иначе при
 	// запуске с относительным путём (--config ./config.yaml, дефолт в main.go)
@@ -69,20 +82,20 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 	}
 	logger.Info("watching config directory", "dir", dir, "file", absPath)
 
-	// Следим за директориями инклюд-файлов
 	watchedDirs := map[string]struct{}{dir: {}}
-	for _, extraDir := range extraDirs {
-		absDir, err := filepath.Abs(extraDir)
+
+	addDir := func(rawDir string) {
+		absDir, err := filepath.Abs(rawDir)
 		if err != nil {
-			continue
+			return
 		}
 		absDir = filepath.Clean(absDir)
 		if _, already := watchedDirs[absDir]; already {
-			continue
+			return
 		}
 		if err := watcher.Add(absDir); err != nil {
 			logger.Error("failed to watch include directory", "dir", absDir, "error", err)
-			continue
+			return
 		}
 		watchedDirs[absDir] = struct{}{}
 		logger.Info("watching include directory", "dir", absDir)
@@ -117,6 +130,11 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 				debounceTimer.Stop()
 			}
 			return
+
+		case dirs := <-updateDirs:
+			for _, d := range dirs {
+				addDir(d)
+			}
 
 		case <-debounceC:
 			debounceC = nil

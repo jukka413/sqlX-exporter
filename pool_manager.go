@@ -128,7 +128,11 @@ func (pm *poolManager) applyConfig(dbs map[string]DBConfig) (toClose map[string]
 			old.cfg.HealthCheckPeriod != dbCfg.HealthCheckPeriod
 
 		if !needUpdate {
-			if exists && old.cfg.Env != dbCfg.Env {
+			// exists здесь всегда true — needUpdate == !exists || ..., поэтому
+			// !needUpdate логически влечёт exists (де Морган). Явную проверку
+			// убрали по замечанию статического анализатора: она была мертвым
+			// кодом, а не защитой от реального случая.
+			if old.cfg.Env != dbCfg.Env {
 				// Только Env изменился — реконнект не нужен (тот же *sql.DB),
 				// но мутировать old.cfg.Env "на месте" нельзя: это shared
 				// указатель, который воркеры могут читать из другой горутины
@@ -184,7 +188,24 @@ func (pm *poolManager) applyConfig(dbs map[string]DBConfig) (toClose map[string]
 	pm.generation++
 	pm.mu.Unlock()
 
+	pm.updateDBUpMetrics()
+
 	return toClose, removedDBs
+}
+
+// updateDBUpMetrics публикует app_db_up для каждой известной БД: 1 если пул
+// сейчас рабочий, 0 если БД в failedPools. В отличие от app_query_up (которой
+// может не существовать вообще, если ни один воркер для этой БД не стартовал)
+// app_db_up есть для каждой БД из конфига всегда.
+func (pm *poolManager) updateDBUpMetrics() {
+	pools := pm.snapshotPools()
+	_, failed := pm.snapshotForReconnect()
+	for name := range pools {
+		dbUp.WithLabelValues(name).Set(1)
+	}
+	for name := range failed {
+		dbUp.WithLabelValues(name).Set(0)
+	}
 }
 
 // commitReconnect проверяет завершённую попытку дозвона против ТЕКУЩЕГО
@@ -240,6 +261,7 @@ func (pm *poolManager) deletePoolMetrics(names []string) {
 		dbPoolAcquired.DeleteLabelValues(name)
 		dbPoolIdle.DeleteLabelValues(name)
 		dbPoolTotal.DeleteLabelValues(name)
+		dbUp.DeleteLabelValues(name)
 	}
 }
 

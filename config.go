@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -10,6 +13,29 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// unmarshalYAMLStrict парсит YAML в строгом режиме: yaml.v3.Decoder.KnownFields(true)
+// проверяет что каждый встреченный ключ соответствует полю структуры-получателя.
+// Опечатка вида "max_conn_lifetme" вместо "max_conn_lifetime" раньше молча
+// игнорировалась (значение просто отбрасывалось, поле оставалось со значением
+// по умолчанию) — теперь это явная ошибка загрузки конфига с указанием файла.
+// Map-поля (Labels, Databases, Queries и т.п.) не затронуты — KnownFields
+// проверяет только соответствие ИМЁН СТРУКТУРНЫХ полей, а не произвольные
+// ключи внутри map, у которых нет фиксированной схемы.
+//
+// io.EOF от Decode() — не ошибка, а нормальный результат для пустого или
+// состоящего только из комментариев файла (в отличие от yaml.Unmarshal,
+// Decoder.Decode() именно так сигнализирует "документов не найдено"). Файл
+// с одними комментариями раньше прекрасно парсился в нулевое значение —
+// без этой проверки он стал бы ошибкой загрузки конфига.
+func unmarshalYAMLStrict(data []byte, out any) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(out); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
+}
 
 type Config struct {
 	Settings AppSettings `yaml:"settings"`
@@ -78,6 +104,17 @@ type Config struct {
 	// пропускается (его databases/queries просто отсутствуют в итоговом
 	// конфиге), а все остальные файлы применяются как обычно.
 	failedIncludes []string `yaml:"-"`
+
+	// dependencies — абсолютные пути ВСЕХ файлов, которые были реально
+	// прочитаны при сборке этого конфига (сам файл + все успешно
+	// загруженные инклюды, рекурсивно). Не из YAML — заполняется кодом.
+	// Нужно watcher'у: раньше директории для отслеживания собирались
+	// ОДИН раз при старте процесса (main.collectIncludeDirs) — новый
+	// инклюд, добавленный через hot-reload в директорию, которая ещё не
+	// отслеживалась, был не виден watcher'у до рестарта Pod'а. Теперь
+	// после каждого reload список пересчитывается из фактически прочитанных
+	// файлов, а не из статического снимка на старте.
+	dependencies []string `yaml:"-"`
 }
 
 // IncludeDefault поддерживает как строку так и список строк в YAML:
@@ -106,6 +143,20 @@ func (id *IncludeDefault) UnmarshalYAML(value *yaml.Node) error {
 type AppSettings struct {
 	DBReconnectInterval string `yaml:"db_reconnect_interval,omitempty"`
 	DefaultDB           string `yaml:"default_db,omitempty"`
+
+	// Дефолты пула соединений — применяются к каждой БД из databases:, у
+	// которой соответствующее поле не задано явно. Имена ключей совпадают
+	// с полями DBConfig намеренно — секции settings: и databases.<name>:
+	// это разные структуры, коллизии имён в YAML нет, а совпадение имён
+	// делает переопределение интуитивным ("то же поле, но конкретно для
+	// этой БД"). Резолвятся в applyDefaultPoolSettings один раз, после
+	// того как domain settings полностью смержены из всех инклюдов —
+	// раньше делать нельзя: более поздний инклюд может переопределить
+	// сам дефолт, и резолвить его нужно уже финальным значением.
+	DefaultMaxConns        int    `yaml:"max_conns,omitempty"`
+	DefaultMaxIdleConns    int    `yaml:"max_idle_conns,omitempty"`
+	DefaultMaxConnLifetime string `yaml:"max_conn_lifetime,omitempty"`
+	DefaultMaxConnIdleTime string `yaml:"max_conn_idle_time,omitempty"`
 }
 
 func (s AppSettings) DBReconnectIntervalDuration() time.Duration {
@@ -197,7 +248,39 @@ func loadConfig(path string) (Config, error) {
 	}
 	rootDir := filepath.Dir(absPath)
 
-	return loadConfigWithContext(path, 0, globalDefault, preview.IncludeDefaults, rootDir)
+	cfg, err := loadConfigWithContext(path, 0, globalDefault, preview.IncludeDefaults, rootDir)
+	if err != nil {
+		return cfg, err
+	}
+	applyDefaultPoolSettings(&cfg)
+	return cfg, nil
+}
+
+// applyDefaultPoolSettings проставляет дефолты пула из settings: в каждую БД,
+// у которой соответствующее поле не задано явно. Явное значение в самой БД
+// всегда имеет приоритет — эта функция только заполняет пробелы.
+//
+// Вызывается ПОСЛЕ полного мержа всех инклюдов (из loadConfig, не изнутри
+// loadConfigWithContext) — settings.* сами могут быть переопределены более
+// поздним инклюдом, резолвить дефолты нужно уже финальным значением, а не
+// тем что было в конкретном файле на момент его собственной загрузки.
+func applyDefaultPoolSettings(cfg *Config) {
+	s := cfg.Settings
+	for name, db := range cfg.Databases {
+		if db.MaxConns == 0 {
+			db.MaxConns = s.DefaultMaxConns
+		}
+		if db.MaxIdleConns == 0 {
+			db.MaxIdleConns = s.DefaultMaxIdleConns
+		}
+		if db.MaxConnLifetime == "" {
+			db.MaxConnLifetime = s.DefaultMaxConnLifetime
+		}
+		if db.MaxConnIdleTime == "" {
+			db.MaxConnIdleTime = s.DefaultMaxConnIdleTime
+		}
+		cfg.Databases[name] = db
+	}
 }
 
 const maxIncludeDepth = 10
@@ -220,8 +303,12 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 		return cfg, err
 	}
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return cfg, err
+	if err := unmarshalYAMLStrict(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("%s: %w", path, err)
+	}
+
+	if absSelf, err := filepath.Abs(path); err == nil {
+		cfg.dependencies = append(cfg.dependencies, filepath.Clean(absSelf))
 	}
 
 	cfg.missingEnvVars = expandURLs(&cfg)
@@ -342,6 +429,7 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 				cfg.missingEnvVars = append(cfg.missingEnvVars, inc.missingEnvVars...)
 				cfg.overwritten = append(cfg.overwritten, inc.overwritten...)
 				cfg.failedIncludes = append(cfg.failedIncludes, inc.failedIncludes...)
+				cfg.dependencies = append(cfg.dependencies, inc.dependencies...)
 			}
 		}
 		cfg.Includes = nil
@@ -699,6 +787,27 @@ func validateDatabasesAndSettings(cfg Config) error {
 	if cfg.Settings.DefaultDB != "" {
 		if _, ok := cfg.Databases[cfg.Settings.DefaultDB]; !ok {
 			return fmt.Errorf("settings.default_db %q is not defined in databases", cfg.Settings.DefaultDB)
+		}
+	}
+	// Валидируем сами дефолты пула ДО того как они разойдутся по всем БД
+	// (applyDefaultPoolSettings уже отработал к этому моменту) — иначе
+	// ошибка вроде settings.max_conns: -1 всплыла бы как "database X:
+	// max_conns must not be negative" в цикле ниже, для каждой БД без
+	// явного override, и не сразу было бы понятно что причина одна общая.
+	if cfg.Settings.DefaultMaxConns < 0 {
+		return fmt.Errorf("settings.max_conns must not be negative")
+	}
+	if cfg.Settings.DefaultMaxIdleConns < 0 {
+		return fmt.Errorf("settings.max_idle_conns must not be negative")
+	}
+	if cfg.Settings.DefaultMaxConnLifetime != "" {
+		if _, err := time.ParseDuration(cfg.Settings.DefaultMaxConnLifetime); err != nil {
+			return fmt.Errorf("settings.max_conn_lifetime is invalid: %w", err)
+		}
+	}
+	if cfg.Settings.DefaultMaxConnIdleTime != "" {
+		if _, err := time.ParseDuration(cfg.Settings.DefaultMaxConnIdleTime); err != nil {
+			return fmt.Errorf("settings.max_conn_idle_time is invalid: %w", err)
 		}
 	}
 
