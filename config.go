@@ -694,8 +694,15 @@ func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
 		}
 	}
 
-	if !isValidPrometheusName(name) {
-		return fmt.Sprintf("query name %q is not a valid Prometheus metric name", name)
+	metricName := q.MetricName
+	if metricName == "" {
+		// Не должно происходить в норме — MetricName проставляется при
+		// первой загрузке файла, до любого клонирования. Фолбэк на name
+		// на случай если это всё же где-то не так, не более того.
+		metricName = name
+	}
+	if !isValidPrometheusName(metricName) {
+		return fmt.Sprintf("metric name %q is not a valid Prometheus metric name", metricName)
 	}
 	for label := range q.Labels {
 		if label == "db" || label == "env" {
