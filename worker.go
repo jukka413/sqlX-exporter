@@ -386,6 +386,14 @@ func runMultiRow(
 			return nil, fmt.Errorf("column %q collides with a reserved or static label name", col)
 		}
 		seenLabelNames[col] = struct{}{}
+		// Имена столбцов известны только после выполнения запроса, поэтому
+		// не могут быть провалидированы на этапе конфига (в отличие от
+		// статических labels: — те уже проверены в config.go). Без этой
+		// проверки столбец вроде "user-id" доехал бы до getOrCreateQueryMetric
+		// и упал бы там с гораздо менее очевидной ошибкой регистрации метрики.
+		if !isValidPrometheusLabelName(col) {
+			return nil, fmt.Errorf("column %q is not a valid Prometheus label name", col)
+		}
 	}
 
 	maxRows := queryCfg.MaxRows
@@ -406,6 +414,17 @@ func runMultiRow(
 		value  float64
 	}
 	buffered := make([]bufferedRow, 0, 64)
+
+	// seenSeries детектит дубликаты комбинаций лейблов внутри ОДНОГО
+	// результата запроса — например SQL без корректного GROUP BY вернул
+	// одну и ту же комбинацию (region, status) дважды с разными value.
+	// Без этой проверки строки просто шли бы в буфер подряд, а на фазе
+	// Commit ниже gauge.Set() для одной и той же серии вызывался бы
+	// дважды — молча побеждает последняя строка, результат зависит от
+	// порядка возврата строк сервером БД (который без явного ORDER BY
+	// не гарантирован). Для exporter'а такая неоднозначность почти
+	// всегда означает ошибку в самом SQL, а не что-то ожидаемое.
+	seenSeries := make(map[string]struct{}, 64)
 
 	// rowsRead считает КАЖДУЮ прочитанную строку, а не только те что успешно
 	// распарсились в число. Раньше лимит проверялся через len(buffered), который
@@ -448,6 +467,15 @@ func runMultiRow(
 		}
 
 		lbls := buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, colLabelValues)
+
+		key := labelsKey(lbls)
+		if _, dup := seenSeries[key]; dup {
+			return nil, fmt.Errorf(
+				"query returned duplicate label set %v — check the SQL's GROUP BY, "+
+					"two rows should not produce the same combination of label values", lbls)
+		}
+		seenSeries[key] = struct{}{}
+
 		buffered = append(buffered, bufferedRow{labels: lbls, value: value})
 	}
 
@@ -490,13 +518,11 @@ func runMultiRow(
 	}
 
 	// Reconciliation: удаляем строки которые были в прошлом запуске но исчезли сейчас.
-	// Строим set текущих лейблов для быстрого поиска.
-	currentSet := make(map[string]struct{}, len(currentLabels))
-	for _, lbl := range currentLabels {
-		currentSet[labelsKey(lbl)] = struct{}{}
-	}
+	// seenSeries уже содержит ровно те же ключи, что понадобились бы здесь —
+	// buffered по построению не содержит дублей (см. проверку выше), так что
+	// повторно строить набор не нужно.
 	for _, lbl := range prevLabels {
-		if _, exists := currentSet[labelsKey(lbl)]; !exists {
+		if _, exists := seenSeries[labelsKey(lbl)]; !exists {
 			metric.Delete(lbl)
 			logger.Info("removed stale metric row", "query", name, "db", queryCfg.DB, "labels", lbl)
 		}
@@ -508,6 +534,15 @@ func runMultiRow(
 // labelsKey строит стабильный строковый ключ из prometheus.Labels.
 // Ключи сортируются явно — порядок итерации по map в Go не гарантирован,
 // и fmt.Sprintf("%v", map) не обеспечивает стабильности между вызовами.
+//
+// Кодирование — length-prefixed (в духе Netstring: "<длина>:<байты>"), не
+// через разделители вроде "key=value,key=value". Разделительное кодирование
+// небезопасно: значение лейбла само может содержать "," или "=" (например
+// TEXT_VALUE со вложенным JSON), и тогда две РАЗНЫЕ комбинации лейблов
+// могли бы сериализоваться в одну и ту же строку — reconciliation молча
+// перепутал бы, какую строку удалять. Явная длина перед каждым компонентом
+// делает разбор однозначным независимо от содержимого — коллизия
+// принципиально невозможна, а не просто маловероятна.
 func labelsKey(lbl prometheus.Labels) string {
 	keys := make([]string, 0, len(lbl))
 	for k := range lbl {
@@ -516,13 +551,14 @@ func labelsKey(lbl prometheus.Labels) string {
 	sort.Strings(keys)
 
 	var sb strings.Builder
-	for i, k := range keys {
-		if i > 0 {
-			sb.WriteByte(',')
-		}
+	for _, k := range keys {
+		v := lbl[k]
+		sb.WriteString(strconv.Itoa(len(k)))
+		sb.WriteByte(':')
 		sb.WriteString(k)
-		sb.WriteByte('=')
-		sb.WriteString(lbl[k])
+		sb.WriteString(strconv.Itoa(len(v)))
+		sb.WriteByte(':')
+		sb.WriteString(v)
 	}
 	return sb.String()
 }
