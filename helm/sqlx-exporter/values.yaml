@@ -133,7 +133,7 @@ resources:
 
 livenessProbe:
   httpGet:
-    path: /metrics
+    path: /healthz
     port: metrics
   initialDelaySeconds: 5
   periodSeconds: 15
@@ -141,7 +141,7 @@ livenessProbe:
 
 readinessProbe:
   httpGet:
-    path: /metrics
+    path: /readyz
     port: metrics
   initialDelaySeconds: 3
   periodSeconds: 10

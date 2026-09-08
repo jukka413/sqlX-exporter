@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +32,31 @@ func main() {
 	// ---- Metrics server ----
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+
+	// /healthz — процесс жив и обрабатывает HTTP-запросы. Не связан с
+	// состоянием конфига или БД — если процесс совсем завис, kubelet должен
+	// узнать об этом именно отсюда.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	// /readyz — хотя бы один reload успешно применил структурно валидный
+	// конфиг. Намеренно не зависит от доступности отдельных БД — partial
+	// outage одной БД штатно переживается (см. failedPools/poolHealthChecker)
+	// и не должен выталкивать здоровый Pod из Service; недоступность БД
+	// видна через свои собственные метрики (app_db_connection_errors_total,
+	// app_query_up), а не через readiness.
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if !a.isReady() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("config not yet applied"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
 	metricsSrv := &http.Server{
 		Addr:              *listenAddr,
 		Handler:           mux,
@@ -39,9 +65,17 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1 MiB
 	}
+
+	// listenErrCh получает ровно одно значение если ListenAndServe упал НЕ
+	// из-за штатного Shutdown(). Раньше такая ошибка (например порт уже
+	// занят) только логировалась — процесс продолжал жить, Pod оставался
+	// Running, а /metrics был недоступен вообще без единого внешнего сигнала
+	// о проблеме. Для exporter'а это фатальная ситуация: его единственная
+	// работа — отдавать /metrics.
+	listenErrCh := make(chan error, 1)
 	go func() {
 		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("metrics server failed", "error", err)
+			listenErrCh <- err
 		}
 	}()
 
@@ -55,15 +89,36 @@ func main() {
 	a.reload()
 
 	// Собираем директории инклюд-файлов для watcher
-	// После reload список инклюдов может измениться — watcher перезапустится
-	// через горутину если список изменился (упрощённо: следим за всеми директориями
-	// которые были в конфиге на старте; при добавлении нового include нужен рестарт).
 	includeDirs := collectIncludeDirs(a.configPath)
 
-	// FSNotify watcher
-	go watchConfig(a.ctx, a.logger, a.configPath, a.reload, includeDirs...)
+	// FSNotify watcher. watcherDone закрывается когда watchConfig
+	// действительно вернулся — то есть больше НИКОГДА не вызовет reload().
+	// main дожидается этого перед stopAllWorkers/closeAllPools (см. ниже,
+	// P1.21): без этого shutdown мог начать разбирать пулы/воркеры пока
+	// watcher ещё выполняет (или вот-вот начнёт) reload(), обращающийся к
+	// уже частично снесённому состоянию.
+	var watcherWG sync.WaitGroup
+	watcherWG.Add(1)
+	go func() {
+		defer watcherWG.Done()
+		watchConfig(a.ctx, a.logger, a.configPath, a.reload, includeDirs...)
+	}()
 
-	<-a.ctx.Done()
+	exitCode := 0
+
+	select {
+	case <-appCtx.Done():
+		logger.Info("shutdown signal received")
+	case err := <-listenErrCh:
+		logger.Error("metrics server failed to listen, shutting down", "error", err)
+		appCancel()
+		exitCode = 1
+	}
+
+	// Дожидаемся watcher'а ДО остановки воркеров и закрытия пулов — гарантия
+	// что ни один reload() не выполняется и не может начаться параллельно
+	// с teardown.
+	watcherWG.Wait()
 
 	logger.Info("shutting down workers")
 	a.stopAllWorkers()
@@ -79,6 +134,7 @@ func main() {
 	}
 
 	logger.Info("application stopped gracefully")
+	os.Exit(exitCode)
 }
 
 // collectIncludeDirs читает конфиг и возвращает директории всех инклюд-файлов

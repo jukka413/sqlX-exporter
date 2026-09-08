@@ -33,11 +33,16 @@ import (
 //	Редакторы часто пишут через временный файл + rename → приходит Create.
 //	Прямая запись → приходит Write.
 //
-// Решение: следим за ДИРЕКТОРИЕЙ (не файлом), реагируем на Write/Create/Remove/Rename.
-// Debounce 150ms защищает от burst-событий.
-// watchConfig следит за основным конфигом и директориями инклюд-файлов.
-// extraDirs — дополнительные директории для наблюдения (из includes в конфиге).
-// При изменении любого файла в отслеживаемых директориях вызывается reload.
+// Debounce и shutdown: reload() вызывается СИНХРОННО в этой же горутине
+// (не через time.AfterFunc в отдельной горутине, как было раньше) — таймер
+// дебаунса читается тем же select, что и ctx.Done()/события fsnotify. Это
+// гарантирует что: (a) reload() никогда не переживёт возврат из watchConfig —
+// вызывающий, дождавшись возврата watchConfig, точно знает что никакой
+// reload() больше не выполняется и не может внезапно стартовать; (b) если
+// reload() уже идёт (может занимать секунды — open/ping нескольких БД) в
+// момент отмены ctx, цикл select не увидит ctx.Done() пока reload() не
+// вернётся — таймер и ctx.Done() физически не могут обрабатываться
+// одновременно в этом однопоточном цикле.
 func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func(), extraDirs ...string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -49,8 +54,7 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 	// absPath вычисляется ДО того как из него берётся директория — иначе при
 	// запуске с относительным путём (--config ./config.yaml, дефолт в main.go)
 	// dir получался бы относительным ("."), а eventDir при событиях всегда
-	// абсолютный — они бы никогда не совпадали, и главная директория конфига
-	// фактически не отслеживалась бы в watchedDirs.
+	// абсолютный — они бы никогда не совпадали.
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		logger.Error("failed to resolve config path", "error", err)
@@ -85,16 +89,25 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 	}
 
 	const debounceDelay = 150 * time.Millisecond
-	var debounceTimer *time.Timer
+	var (
+		debounceTimer *time.Timer
+		debounceC     <-chan time.Time
+	)
 
 	triggerReload := func() {
-		if debounceTimer != nil {
-			debounceTimer.Stop()
+		if debounceTimer == nil {
+			debounceTimer = time.NewTimer(debounceDelay)
+			debounceC = debounceTimer.C
+			return
 		}
-		debounceTimer = time.AfterFunc(debounceDelay, func() {
-			logger.Info("config change detected, reloading")
-			reload()
-		})
+		if !debounceTimer.Stop() {
+			select {
+			case <-debounceTimer.C:
+			default:
+			}
+		}
+		debounceTimer.Reset(debounceDelay)
+		debounceC = debounceTimer.C
 	}
 
 	for {
@@ -104,6 +117,17 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 				debounceTimer.Stop()
 			}
 			return
+
+		case <-debounceC:
+			debounceC = nil
+			if ctx.Err() != nil {
+				// select мог одновременно увидеть готовый таймер и отменённый
+				// ctx — явная проверка на случай если выбор пал на таймер:
+				// не стартуем новый reload когда shutdown уже начался.
+				continue
+			}
+			logger.Info("config change detected, reloading")
+			reload()
 
 		case event, ok := <-watcher.Events:
 			if !ok {
@@ -117,16 +141,15 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 			eventAbs = filepath.Clean(eventAbs)
 
 			// Сравниваем только по полному абсолютному пути — сравнение по
-			// одному basename (как было раньше) могло ложно совпасть с
-			// одноимённым файлом в другой отслеживаемой директории.
+			// одному basename могло бы ложно совпасть с одноимённым файлом
+			// в другой отслеживаемой директории.
 			isMainConfig := eventAbs == absPath
 			// ..data — специальный симлинк который kubelet переключает атомарно
 			// при обновлении ЛЮБОГО файла в ConfigMap. Реагируем всегда.
 			isDataSymlink := filepath.Base(eventAbs) == "..data"
 			// Инклюд-файлы лежат в watchedDirs под своими собственными именами
 			// (oracle-metrics.yaml и т.п.), не совпадающими с basename основного
-			// конфига — без этой проверки их изменения тихо игнорировались бы
-			// и hot-reload для инклюдов не работал бы вообще.
+			// конфига — без этой проверки их изменения тихо игнорировались бы.
 			isYAMLInWatchedDir := func() bool {
 				ext := filepath.Ext(eventAbs)
 				if ext != ".yaml" && ext != ".yml" {

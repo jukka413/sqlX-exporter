@@ -30,6 +30,16 @@ type app struct {
 	// предыдущий вызов (open/ping нескольких БД, до 5с на каждую) ещё не
 	// завершился.
 	reloadMu sync.Mutex
+
+	// configReady — true как только хотя бы один reload успешно прошёл
+	// структурную валидацию (загрузился и не провалился на
+	// validateDatabasesAndSettings). Используется /readyz — раньше при
+	// невалидном стартовом конфиге процесс продолжал жить и /metrics
+	// отдавал только runtime-метрики, а Kubernetes считал Pod полностью
+	// рабочим. Намеренно НЕ зависит от доступности отдельных БД — частичный
+	// outage одной БД штатно переживается архитектурой (см. failedPools),
+	// и не должен выталкивать здоровый Pod из Service.
+	configReady bool
 }
 
 func newApp(ctx context.Context, cancel context.CancelFunc, logger *slog.Logger, configPath string) *app {
@@ -48,6 +58,14 @@ func (a *app) getDefaultDB() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.defaultDB
+}
+
+// isReady сообщает применялся ли конфиг успешно хотя бы раз — см. комментарий
+// у configReady в типе app.
+func (a *app) isReady() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.configReady
 }
 
 // =========================================================================
@@ -171,6 +189,7 @@ func (a *app) reload() {
 	a.mu.Lock()
 	a.reconnectInterval = newCfg.Settings.DBReconnectIntervalDuration()
 	a.defaultDB = newCfg.Settings.DefaultDB
+	a.configReady = true
 	a.mu.Unlock()
 
 	// Воркеры реконсилируются ДО закрытия старых пулов, не после. reconcile
