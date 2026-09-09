@@ -92,6 +92,13 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 		pEntry, ok := pools[q.DB]
 		if !ok || pEntry == nil || pEntry.db == nil {
 			wm.logger.Error("db not available for query", "query", name, "db", q.DB)
+			// Если для этой query уже был воркер — его нужно остановить, а не
+			// оставить работать на прежней БД. Конфиг для этой query теперь
+			// указывает на БД, к которой нет пула — держать воркер на СТАРОМ
+			// пуле нельзя: та БД могла быть убрана из конфига этим же reload
+			// и её пул через пару строк закроет pm.applyConfig, а воркер
+			// продолжил бы получать "sql: database is closed".
+			wm.stopWorker(name)
 			continue
 		}
 		q.DBEnv = pEntry.cfg.Env
@@ -161,40 +168,60 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 	}
 
 	wm.mu.Lock()
-	for name, w := range wm.workers {
+	var toRemove []string
+	for name := range wm.workers {
 		if _, ok := queries[name]; !ok {
-			wm.logger.Info("stopping removed query", "query", name)
-			w.cancel()
-			wg := w.wg
-			metricName := w.cfg.MetricName
-			stoppedCfg := w.cfg
-			stoppedPrevLabels := w.prevLabels
-			delete(wm.workers, name)
-
-			// Другой воркер может делить это же MetricName (cloneQueriesForDB
-			// на несколько БД) — тогда снести метрику целиком нельзя.
-			sharedByOthers := false
-			for otherName, otherW := range wm.workers {
-				if otherName != name && otherW.cfg.MetricName == metricName {
-					sharedByOthers = true
-					break
-				}
-			}
-
-			wm.mu.Unlock()
-			wg.Wait()
-
-			if metricName != "" {
-				if !sharedByOthers {
-					unregisterQueryMetric(metricName)
-				} else {
-					deleteWorkerRows(stoppedCfg, stoppedPrevLabels)
-				}
-			}
-			wm.mu.Lock()
+			toRemove = append(toRemove, name)
 		}
 	}
 	wm.mu.Unlock()
+
+	for _, name := range toRemove {
+		wm.logger.Info("stopping removed query", "query", name)
+		wm.stopWorker(name)
+	}
+}
+
+// stopWorker останавливает и убирает воркер name из wm.workers, снимая
+// метрику целиком (если её больше никто не использует) или только его
+// собственные строки (если использует — cloneQueriesForDB на несколько БД).
+//
+// Общий путь для двух случаев: запрос исчез из конфига целиком, и запрос
+// остался, но резолвится в БД, к которой сейчас нет пула (см. reconcile —
+// без этого вызова там воркер остался бы работать на СТАРОЙ, уже не
+// актуальной БД, и рисковал держать ссылку на пул, который вот-вот закроют).
+func (wm *workerManager) stopWorker(name string) {
+	wm.mu.Lock()
+	w, exists := wm.workers[name]
+	if !exists {
+		wm.mu.Unlock()
+		return
+	}
+	w.cancel()
+	wg := w.wg
+	metricName := w.cfg.MetricName
+	stoppedCfg := w.cfg
+	stoppedPrevLabels := w.prevLabels
+	delete(wm.workers, name)
+
+	sharedByOthers := false
+	for otherName, otherW := range wm.workers {
+		if otherName != name && otherW.cfg.MetricName == metricName {
+			sharedByOthers = true
+			break
+		}
+	}
+	wm.mu.Unlock()
+
+	wg.Wait()
+
+	if metricName != "" {
+		if !sharedByOthers {
+			unregisterQueryMetric(metricName)
+		} else {
+			deleteWorkerRows(stoppedCfg, stoppedPrevLabels)
+		}
+	}
 }
 
 func (wm *workerManager) stopAll() {
