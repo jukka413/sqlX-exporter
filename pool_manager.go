@@ -126,8 +126,7 @@ func (pm *poolManager) applyConfig(revision uint64, dbs map[string]DBConfig) (to
 			old.cfg.MaxConns != dbCfg.MaxConns ||
 			old.cfg.MaxIdleConns != dbCfg.MaxIdleConns ||
 			old.cfg.MaxConnLifetime != dbCfg.MaxConnLifetime ||
-			old.cfg.MaxConnIdleTime != dbCfg.MaxConnIdleTime ||
-			old.cfg.HealthCheckPeriod != dbCfg.HealthCheckPeriod
+			old.cfg.MaxConnIdleTime != dbCfg.MaxConnIdleTime
 
 		if !needUpdate {
 			if old.cfg.Env != dbCfg.Env {

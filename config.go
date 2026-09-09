@@ -108,9 +108,8 @@ type DBConfig struct {
 	MaxConns     int `yaml:"max_conns"`
 	MaxIdleConns int `yaml:"max_idle_conns"`
 
-	MaxConnLifetime   string `yaml:"max_conn_lifetime,omitempty"`
-	MaxConnIdleTime   string `yaml:"max_conn_idle_time,omitempty"`
-	HealthCheckPeriod string `yaml:"health_check_period,omitempty"`
+	MaxConnLifetime string `yaml:"max_conn_lifetime,omitempty"`
+	MaxConnIdleTime string `yaml:"max_conn_idle_time,omitempty"`
 }
 
 type QueryConfig struct {
@@ -657,11 +656,6 @@ func validateDatabasesAndSettings(cfg Config) error {
 			}
 			if d <= 0 {
 				return fmt.Errorf("database %q: max_conn_idle_time must be positive", name)
-			}
-		}
-		if db.HealthCheckPeriod != "" {
-			if _, err := time.ParseDuration(db.HealthCheckPeriod); err != nil {
-				return fmt.Errorf("database %q has invalid health_check_period: %w", name, err)
 			}
 		}
 	}
