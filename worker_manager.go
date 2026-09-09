@@ -243,6 +243,11 @@ func (wm *workerManager) stopWorker(name string) bool {
 		} else {
 			deleteWorkerRows(stoppedCfg, stoppedPrevLabels)
 		}
+		// Ключ (metricName, db) уже уникален для этого конкретного воркера
+		// даже при клонировании на несколько БД (у каждого клона db своё) —
+		// в отличие от бизнес-метрики, здесь sharedByOthers не имеет
+		// значения, чистим всегда.
+		deleteQueryHealthMetrics(metricName, stoppedCfg.DB)
 	}
 	return true
 }

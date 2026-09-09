@@ -275,3 +275,28 @@ func deleteWorkerRows(cfg QueryConfig, prevLabels *[]prometheus.Labels) {
 	}
 	m.Delete(buildLabelValues(cfg.DB, cfg.DBEnv, cfg.Labels, nil))
 }
+
+// deleteQueryHealthMetrics удаляет служебные метрики о состоянии запроса —
+// app_query_up, app_query_last_success_timestamp_seconds, app_query_errors_total,
+// app_query_duration_seconds. В отличие от бизнес-метрики (unregisterQueryMetric/
+// deleteWorkerRows), про них раньше забывали при остановке воркера — они
+// оставались замороженными на последнем значении навсегда, включая
+// app_query_up=0, что выглядело бы как вечно горящий алерт для запроса,
+// которого уже нет в конфиге.
+//
+// Ключ здесь — (metricName, db), а не сам MetricName целиком (как для
+// business-метрики) — при клонировании на несколько БД у каждого клона
+// db разное, поэтому удаление одного клона не задевает остальные.
+func deleteQueryHealthMetrics(metricName, db string) {
+	if metricName == "" {
+		return
+	}
+	queryUp.DeleteLabelValues(metricName, db)
+	queryLastSuccess.DeleteLabelValues(metricName, db)
+	queryDuration.DeleteLabelValues(metricName, db)
+	// reason заранее неизвестен — какие из трёх встречались для этого
+	// воркера мы не отслеживаем, поэтому удаляем все возможные комбинации.
+	for _, reason := range []string{"timeout", "db_error", "cancelled"} {
+		queryErrors.DeleteLabelValues(metricName, db, reason)
+	}
+}
