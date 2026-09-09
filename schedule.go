@@ -40,10 +40,7 @@ func validateSchedule(s *ScheduleConfig) error {
 	return nil
 }
 
-// sameQueryConfig сравнивает две версии конфига запроса чтобы решить нужен ли
-// рестарт воркера. MaxRows включён в сравнение — без него смена лимита строк
-// в конфиге не подхватывалась бы на лету, воркер продолжал бы использовать
-// значение, скопированное в QueryConfig при своём последнем старте.
+// sameQueryConfig решает нужен ли рестарт воркера при изменении конфига.
 func sameQueryConfig(a, b QueryConfig) bool {
 	return a.DB == b.DB &&
 		a.SQL == b.SQL &&
@@ -56,12 +53,8 @@ func sameQueryConfig(a, b QueryConfig) bool {
 		sameSchedule(a.Schedule, b.Schedule)
 }
 
-// sameLabelKeys сравнивает только НАЗВАНИЯ статических лейблов — это то, что
-// определяет схему лейблов Prometheus-метрики (GaugeVec). Если labels.cluster
-// был и остался, а изменилось только его значение (prod-a → prod-b) — схема
-// не изменилась, изменилась только identity конкретной time series.
-// Раньше это не разделялось: смена ЗНАЧЕНИЯ лейбла ошибочно считалась
-// сменой схемы и приводила к полному unregister метрики.
+// sameLabelKeys сравнивает только имена лейблов — это определяет схему
+// GaugeVec. Смена значения при том же наборе имён — не смена схемы.
 func sameLabelKeys(a, b map[string]string) bool {
 	if len(a) != len(b) {
 		return false
@@ -74,10 +67,8 @@ func sameLabelKeys(a, b map[string]string) bool {
 	return true
 }
 
-// sameLabelValues сравнивает значения статических лейблов (предполагая что
-// набор ключей уже одинаков — это отдельно проверяет sameLabelKeys).
-// Отвечает на вопрос "изменилась ли identity time series", а не "изменилась
-// ли схема метрики".
+// sameLabelValues сравнивает значения (набор ключей уже проверен sameLabelKeys) —
+// отвечает на вопрос "изменилась ли identity time series".
 func sameLabelValues(a, b map[string]string) bool {
 	if len(a) != len(b) {
 		return false

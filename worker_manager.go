@@ -12,16 +12,13 @@ type worker struct {
 	cancel     context.CancelFunc
 	wg         *sync.WaitGroup
 	cfg        QueryConfig
-	pool       *dbPool // пул к которому привязан воркер — см. poolChanged в reconcile
+	pool       *dbPool
 	prevLabels *[]prometheus.Labels
 }
 
-// workerManager — единственный владелец жизненного цикла воркеров запросов:
-// старт, остановка, и решение о том, когда изменение конфига требует
-// рестарта. Это также единственное место, которое решает когда Prometheus-
-// метрику можно снять с регистрации целиком, а когда нужно удалить только
-// строки конкретного воркера — сам воркер (worker.go) никогда не трогает
-// Registry lifecycle напрямую.
+// workerManager — единственный владелец жизненного цикла воркеров: старт,
+// остановка, и решение о снятии Prometheus-метрики с регистрации. Сам
+// воркер (worker.go) никогда не трогает Registry напрямую.
 type workerManager struct {
 	ctx    context.Context
 	logger *slog.Logger
@@ -30,10 +27,9 @@ type workerManager struct {
 	reconcileMu sync.Mutex
 	workers     map[string]*worker
 
-	// lastQueries — снэпшот последнего применённого желаемого состояния
-	// запросов. Нужен poolHealthChecker'у в app.go, чтобы после успешного
-	// реконнекта БД запустить воркеры для неё без повторного чтения файла
-	// конфига.
+	// lastQueries — снэпшот последнего применённого состояния запросов.
+	// Нужен poolHealthChecker'у чтобы после реконнекта БД запустить
+	// воркеры без повторного чтения файла конфига.
 	lastQueries map[string]QueryConfig
 }
 
@@ -56,13 +52,11 @@ func (wm *workerManager) snapshotLastQueries() map[string]QueryConfig {
 	return out
 }
 
-// reconcile приводит запущенные воркеры в соответствие с желаемым состоянием
-// queries, используя переданный снэпшот доступных пулов и резолвленное имя
-// БД по умолчанию.
+// reconcile приводит воркеры в соответствие с queries, используя снэпшот
+// доступных пулов и резолвленное имя БД по умолчанию.
 func (wm *workerManager) reconcile(queries map[string]QueryConfig, pools map[string]*dbPool, defaultDB string) {
-	// Без этого лока reload() и poolHealthChecker() могут вызвать reconcile
-	// параллельно: обе горутины одновременно видят отсутствие воркера для
-	// одного query name, обе стартуют свой воркер, один теряется без cancel.
+	// Сериализует reconcile сам с собой — reload() и poolHealthChecker()
+	// вызывают его из разных горутин.
 	wm.reconcileMu.Lock()
 	defer wm.reconcileMu.Unlock()
 
@@ -91,55 +85,35 @@ func (wm *workerManager) reconcile(queries map[string]QueryConfig, pools map[str
 			wm.logger.Error("db not available for query", "query", name, "db", q.DB)
 			continue
 		}
-
-		// DBEnv резолвится здесь, не при загрузке конфига — только тут известна
-		// связка "запрос → его пул".
 		q.DBEnv = pEntry.cfg.Env
 
 		w, exists := currentWorkers[name]
 
-		// poolChanged: тот же query config, но пул этой БД был пересоздан
-		// (например изменился url или пароль). Без этой проверки воркер
-		// продолжал бы держать ссылку на *sql.DB который уже закрыт извне —
-		// все последующие тики падали бы с "sql: database is closed", хотя
-		// сам query не менялся вообще.
+		// Пул этой БД пересоздан (например сменился url) — старая ссылка
+		// на *sql.DB уже недействительна, даже если сам query не менялся.
 		poolChanged := exists && w.pool != pEntry
 
-		// schemaChanged: изменился НАБОР ИМЁН статических лейблов или
-		// value_column — то, что определяет схему GaugeVec.
+		// Смена набора имён лейблов/value_column меняет схему GaugeVec.
+		// Prometheus не допускает regenerate схемы под тем же именем даже
+		// после Unregister (Registry хранит dimHashesByName на весь срок
+		// жизни процесса) — поэтому эти два поля откатываем к уже
+		// зарегистрированным, а остальные изменения (SQL, DB, pool и т.д.)
+		// применяем как обычно.
 		schemaChanged := exists &&
 			(w.cfg.ValueColumn != q.ValueColumn || !sameLabelKeys(w.cfg.Labels, q.Labels))
-
 		if schemaChanged {
-			// Prometheus не позволяет поменять схему лейблов уже
-			// зарегистрированной метрики без пересоздания процесса —
-			// Registry.Unregister() намеренно не чистит внутренний
-			// dimHashesByName ("must be consistent throughout the lifetime
-			// of a program"), поэтому повторная регистрация под тем же
-			// именем с ДРУГИМ набором лейблов продолжает падать даже после
-			// Unregister. Раньше здесь всё равно делался unregister+restart:
-			// в лучшем случае query оставался постоянно сломанным (ошибка
-			// регистрации на каждый запуск) вплоть до рестарта Pod'а, а в
-			// худшем — несогласованно ломал метрику для ДРУГОГО воркера,
-			// который случайно делит с этим то же MetricName (multi-DB
-			// клонирование), но сам ещё не увидел это изменение схемы.
-			// Честнее явно отказаться применять именно эту часть изменения:
-			// старый воркер продолжает работать со старой схемой, а
-			// исправить это может только рестарт процесса.
 			wm.logger.Error(
 				"labels or value_column changed for a running query — Prometheus does not support "+
-					"changing a metric's label schema without a process restart; keeping the previous "+
-					"version running until the process is restarted",
+					"changing a metric's label schema without a process restart; applying every other "+
+					"change (sql/db/timeout/interval) but keeping the previous label schema until restart",
 				"query", name, "db", q.DB)
-			continue
+			q.Labels = w.cfg.Labels
+			q.ValueColumn = w.cfg.ValueColumn
 		}
 
-		// identityChanged: DB, env или ЗНАЧЕНИЕ статического лейбла
-		// изменились (при неизменном наборе имён лейблов — это уже
-		// проверено выше). Такое изменение не трогает схему метрики, но
-		// перемещает данные на другую time series — старая строка больше
-		// никогда не будет перезаписана новым воркером и должна быть
-		// удалена явно, иначе она останется висеть в GaugeVec навсегда.
+		// DB/env/значение лейбла изменились (набор имён — тот же, иначе
+		// поймали бы это выше) — данные переезжают на другую time series,
+		// старую нужно удалить явно, иначе она зависнет в GaugeVec навсегда.
 		identityChanged := exists &&
 			(w.cfg.DB != q.DB || w.cfg.DBEnv != q.DBEnv || !sameLabelValues(w.cfg.Labels, q.Labels))
 
@@ -152,7 +126,6 @@ func (wm *workerManager) reconcile(queries map[string]QueryConfig, pools map[str
 			wm.logger.Info("stopping changed query worker", "query", name)
 			w.cancel()
 			w.wg.Wait()
-
 			if identityChanged && w.cfg.MetricName != "" {
 				deleteWorkerRows(w.cfg, w.prevLabels)
 			}
@@ -160,11 +133,6 @@ func (wm *workerManager) reconcile(queries map[string]QueryConfig, pools map[str
 
 		var prevLabels *[]prometheus.Labels
 		if exists && w.prevLabels != nil && !identityChanged {
-			// Переиспользуем prevLabels только если identity не менялась —
-			// иначе в нём остались лейблы под старой identity и
-			// reconciliation попытается Delete() строки, которые уже не
-			// совпадают с текущим набором (для multi-row) либо просто
-			// бессмысленны (для single-value, где prevLabels не используется).
 			prevLabels = w.prevLabels
 		} else {
 			prevLabels = &[]prometheus.Labels{}
@@ -173,11 +141,9 @@ func (wm *workerManager) reconcile(queries map[string]QueryConfig, pools map[str
 		wg := &sync.WaitGroup{}
 		wg.Add(1)
 		ctx, cancel := context.WithCancel(wm.ctx)
-
 		go startQueryWorker(ctx, wg, wm.logger, name, q, pEntry.db, prevLabels)
 
 		newW := &worker{cancel: cancel, wg: wg, cfg: q, pool: pEntry, prevLabels: prevLabels}
-
 		wm.mu.Lock()
 		wm.workers[name] = newW
 		wm.mu.Unlock()
@@ -196,11 +162,8 @@ func (wm *workerManager) reconcile(queries map[string]QueryConfig, pools map[str
 			stoppedPrevLabels := w.prevLabels
 			delete(wm.workers, name)
 
-			// Проверяем не использует ли ЕЩЁ ЖИВОЙ воркер тот же MetricName —
-			// случай cloneQueriesForDB, когда один файл метрик подключён для
-			// нескольких БД. Если убрать только одну БД из include_defaults,
-			// нельзя снести метрику целиком: воркер для второй БД продолжает
-			// в неё писать.
+			// Другой воркер может делить это же MetricName (cloneQueriesForDB
+			// на несколько БД) — тогда снести метрику целиком нельзя.
 			sharedByOthers := false
 			for otherName, otherW := range wm.workers {
 				if otherName != name && otherW.cfg.MetricName == metricName {
@@ -225,7 +188,6 @@ func (wm *workerManager) reconcile(queries map[string]QueryConfig, pools map[str
 	wm.mu.Unlock()
 }
 
-// stopAll останавливает все воркеры и дожидается их завершения.
 func (wm *workerManager) stopAll() {
 	wm.mu.Lock()
 	workers := make([]*worker, 0, len(wm.workers))

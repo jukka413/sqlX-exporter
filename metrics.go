@@ -48,19 +48,14 @@ var (
 	)
 
 	// configIncludeFailures — сколько инклюдов не удалось загрузить при
-	// последнем reload (файл не найден, битый YAML). Начиная с фикса,
-	// такая ошибка не блокирует остальной конфиг — но это значит что
-	// проблема больше не видна из самого факта "reload complete" в логах.
-	// Алерт на эту метрику даёт то же самое, что раньше давал упавший
-	// reload, но не жертвуя устойчивостью остального конфига.
+	// последнем reload. Такая ошибка не блокирует остальной конфиг, поэтому
+	// не видна из самого факта "reload complete" — эта метрика даёт то,
+	// на что можно поставить алерт.
 	configIncludeFailures = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "app_config_include_failures",
 		Help: "Number of includes that failed to load during the last config reload",
 	})
 
-	// configReloadTotal — счётчик попыток reload по результату. Позволяет
-	// алертить на "reload постоянно фейлится" (rate(...{result!="success"}[5m]) > 0)
-	// без разбора логов.
 	configReloadTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "app_config_reload_total",
@@ -70,28 +65,19 @@ var (
 		[]string{"result"},
 	)
 
-	// configLastReloadTimestamp — время последней ПОПЫТКИ reload, вне
-	// зависимости от результата. Если эта метрика перестала расти —
-	// watcher/reload-цикл завис, что само по себе достаточно серьёзно чтобы
-	// быть видимым отдельно от успешности содержимого конфига.
 	configLastReloadTimestamp = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "app_config_last_reload_timestamp_seconds",
 		Help: "Unix timestamp of the last config reload attempt, regardless of outcome",
 	})
 
-	// configLastSuccessTimestamp — время последнего УСПЕШНОГО reload.
-	// Вместе с configLastReloadTimestamp разница между ними показывает
-	// сколько времени конфиг не может примениться.
 	configLastSuccessTimestamp = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "app_config_last_reload_success_timestamp_seconds",
 		Help: "Unix timestamp of the last successful config reload",
 	})
 
-	// dbUp — состояние подключения к каждой сконфигурированной БД: 1 если
-	// пул сейчас рабочий, 0 если БД в failedPools. В отличие от
-	// app_query_up (которого может не быть вообще, если ни один воркер для
-	// этой БД так и не стартовал), dbUp существует для каждой БД из
-	// конфига всегда, независимо от того, есть ли у нее хоть один запрос.
+	// dbUp — 1 если пул рабочий, 0 если БД в failedPools. Существует для
+	// каждой БД конфига всегда, в отличие от app_query_up, которой может не
+	// быть если ни один воркер для этой БД не стартовал.
 	dbUp = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "app_db_up",
@@ -164,27 +150,18 @@ var (
 	metricsMu          sync.Mutex
 )
 
-// getOrCreateQueryMetric безопасно возвращает или создаёт GaugeVec для данного запроса.
+// getOrCreateQueryMetric возвращает или создаёт GaugeVec для запроса.
+// Лейблы: "db", "env" (всегда), customLabels (статические из labels:),
+// colLabels (динамические из имён столбцов SELECT для multi-row).
 //
-// Лейблы формируются из трёх источников (все опциональны):
-//   - "db", "env"   — всегда присутствуют
-//   - customLabels  — статические лейблы из поля labels: в конфиге
-//   - colLabels     — динамические лейблы из имён столбцов SELECT (для value_column режима)
-//
-// ВАЖНО: если под этим именем метрики уже был зарегистрирован GaugeVec с ДРУГИМ
-// набором лейблов (когда-либо в этом процессе, до или после Unregister),
-// prometheus.Register() вернёт ошибку. Registry.Unregister() намеренно НЕ чистит
-// внутренний dimHashesByName — в комментарии к исходнику client_golang это
-// объясняется так: "must be consistent throughout the lifetime of a program".
-// Поэтому "снять и пересоздать" метрику с другой схемой лейблов (после смены
-// labels:/value_column: в конфиге, или при коллизии имени между двумя разными
-// файлами метрик) не работает так, как может показаться — это ограничение
-// самого client_golang, а не решаемая здесь проблема. Раньше в этом месте был
-// panic(err) на такой ошибке — один неудачно изменённый запрос ронял процесс
-// целиком и останавливал сбор метрик вообще для всех остальных запросов.
-// Теперь это обычная ошибка запроса: query_up=0, понятный лог, но остальные
-// запросы продолжают работать как ни в чём не бывало. Снимается только
-// перезапуском процесса — тогда Prometheus registry пересоздаётся с нуля.
+// Если под этим именем уже был зарегистрирован GaugeVec с другим набором
+// лейблов (когда-либо в этом процессе, до или после Unregister) — Register()
+// вернёт ошибку: Registry.Unregister() намеренно не чистит внутренний
+// dimHashesByName ("must be consistent throughout the lifetime of a program").
+// "Снять и пересоздать" метрику с другой схемой поэтому не работает — это
+// ограничение client_golang, не решаемая здесь проблема. Ошибка возвращается
+// как обычная ошибка запроса (query_up=0), не паника — снимается только
+// перезапуском процесса.
 func getOrCreateQueryMetric(queryName string, customLabels map[string]string, colLabels []string) (*prometheus.GaugeVec, error) {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
@@ -221,31 +198,20 @@ func getOrCreateQueryMetric(queryName string, customLabels map[string]string, co
 	return metric, nil
 }
 
-// buildLabelNames возвращает упорядоченный список имён лейблов:
-//  1. "db" — всегда первый
-//  2. "env" — всегда второй, значение из databases.<db>.env (пустая строка если
-//     не задано). Присутствует всегда, а не только когда env реально указан —
-//     иначе GaugeVec для одного и того же имени метрики мог бы получить разные
-//     наборы лейблов при клонировании запроса на несколько БД (одна с env,
-//     другая без), что приводит к панике при With().
-//  3. статические лейблы из customLabels — в алфавитном порядке
-//  4. динамические лейблы из colLabels (имена столбцов) — в исходном порядке столбцов
-//
-// Такой порядок гарантирует стабильность между вызовами — Prometheus требует
-// чтобы имена и значения лейблов передавались в одном и том же порядке.
+// buildLabelNames: "db", "env" (всегда — фиксированная схема нужна даже
+// когда env не задан, иначе клонирование запроса на несколько БД могло бы
+// дать разные наборы лейблов и вызвать панику в With()), затем статические
+// лейблы (сорт.), затем динамические из колонок (порядок SELECT).
 func buildLabelNames(customLabels map[string]string, colLabels []string) []string {
 	names := make([]string, 0, 2+len(customLabels)+len(colLabels))
 	names = append(names, "db", "env")
 
-	// Статические лейблы из конфига — сортируем для детерминированности
 	staticKeys := make([]string, 0, len(customLabels))
 	for k := range customLabels {
 		staticKeys = append(staticKeys, k)
 	}
 	sort.Strings(staticKeys)
 	names = append(names, staticKeys...)
-
-	// Динамические лейблы из столбцов — сохраняем порядок столбцов из SELECT
 	names = append(names, colLabels...)
 
 	return names
@@ -277,16 +243,9 @@ func lookupQueryMetric(queryName string) (*prometheus.GaugeVec, bool) {
 }
 
 // unregisterQueryMetric полностью убирает метрику из Prometheus registry и
-// из внутренней map queryResultMetrics.
-//
-// Без этого вызова удаление запроса из конфига (через hot-reload или
-// sanitizeQueries) останавливает воркер, но саму метрику оставляет навечно
-// зарегистрированной в Prometheus с последним известным значением —
-// time series просто замораживается и никогда не пропадает с /metrics.
-// При частых hot-reload (несколько values файлов в одном проекте, частые
-// изменения списка запросов) это постепенно копит мёртвые метрики.
-//
-// Вызывается из reconcileWorkers в момент когда запрос пропал из конфига.
+// из queryResultMetrics. Без этого удалённый из конфига запрос оставлял бы
+// метрику навечно зарегистрированной с последним известным значением.
+// Вызывается из workerManager.reconcile, когда запрос пропал из конфига.
 func unregisterQueryMetric(queryName string) {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
@@ -299,16 +258,10 @@ func unregisterQueryMetric(queryName string) {
 	delete(queryResultMetrics, queryName)
 }
 
-// deleteWorkerRows удаляет все Prometheus-строки, за которые отвечал воркер,
-// не трогая регистрацию самой метрики (метрика может ещё использоваться
-// другими воркерами с тем же MetricName). Для multi-row удаляет каждую строку
-// из prevLabels; для single-value (prevLabels пуст) — единственную строку,
-// вычисленную из текущей комбинации лейблов cfg.
-//
-// Используется в двух местах: когда воркер полностью убран но метрику нельзя
-// снести целиком (её использует другой воркер), и когда воркер перезапускается
-// с другим значением env — в обоих случаях "старые" строки иначе остались бы
-// висеть в GaugeVec навсегда, так как никто их больше не перезаписывает.
+// deleteWorkerRows удаляет строки, за которые отвечал воркер, не трогая
+// регистрацию метрики (её может ещё использовать другой воркер с тем же
+// MetricName). Multi-row — все строки из prevLabels; single-value — одна,
+// вычисленная из текущих лейблов cfg.
 func deleteWorkerRows(cfg QueryConfig, prevLabels *[]prometheus.Labels) {
 	m, ok := lookupQueryMetric(cfg.MetricName)
 	if !ok {

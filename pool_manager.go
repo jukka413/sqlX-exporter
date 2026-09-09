@@ -15,24 +15,21 @@ type dbPool struct {
 	db  *sql.DB
 }
 
-// poolManager — единственный владелец подключений к БД в этом приложении.
-// Это единственное место, которое имеет право вызывать sql.DB.Close().
-// pools, failedPools и generation всегда мутируются вместе, под одним локом,
-// в applyConfig() и commitReconnect(). Это не случайность, а то, что закрывает
-// P0.1 из ревью: reconnect-попытка снимает (generation, failedPools) единым
-// атомарным снэпшотом через snapshotForReconnect(), дозванивается ВНЕ лока
-// (может занимать секунды), и перепроверяет generation И конкретный DBConfig
-// перед коммитом. Раньше generation увеличивался в начале reload(), ДО того
-// как buildPools вообще начинал дозваниваться — это оставляло реальное окно,
-// в котором health-checker мог снять снэпшот УЖЕ С НОВЫМ generation, но ещё
-// СО СТАРЫМИ failedPools/queriesCfg (если reload как раз между "увеличил
-// generation" и "закоммитил новое состояние"), и проверка "не устарело ли"
-// проходила бы успешно на паре из разных момента времени. Теперь generation
-// увеличивается СТРОГО в том же критическом участке, что и сам коммит pools/
-// failedPools — рассинхронизация этих двух вещей структурно невозможна.
+// poolManager — единственный владелец подключений к БД; только он вызывает
+// sql.DB.Close(). pools, failedPools и generation всегда мутируются вместе
+// под одним локом (applyConfig, commitReconnect) — это гарантирует, что
+// reconnect-попытка, снявшая (generation, failedPools) единым снэпшотом,
+// не может увидеть их в рассинхронизированном состоянии при повторной
+// проверке перед коммитом.
 type poolManager struct {
 	ctx    context.Context
 	logger *slog.Logger
+
+	// transitionMu сериализует applyConfig и commitReconnect целиком —
+	// от снэпшота до коммита, не только доступ к map (для этого есть mu).
+	// Без него коммит applyConfig (полная замена pools) мог бы затереть
+	// pool, который commitReconnect только что восстановил параллельно.
+	transitionMu sync.Mutex
 
 	mu          sync.Mutex
 	pools       map[string]*dbPool
@@ -49,7 +46,6 @@ func newPoolManager(ctx context.Context, logger *slog.Logger) *poolManager {
 	}
 }
 
-// snapshotPools возвращает копию текущих активных пулов.
 func (pm *poolManager) snapshotPools() map[string]*dbPool {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -60,9 +56,8 @@ func (pm *poolManager) snapshotPools() map[string]*dbPool {
 	return out
 }
 
-// snapshotForReconnect возвращает согласованную пару (generation, failedPools).
-// Согласованность гарантируется тем, что оба значения читаются под одним
-// локом и нигде в коде не мутируются раздельно — см. комментарий у типа.
+// snapshotForReconnect возвращает generation и failedPools как согласованную
+// пару — см. комментарий у типа.
 func (pm *poolManager) snapshotForReconnect() (uint64, map[string]DBConfig) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -73,9 +68,8 @@ func (pm *poolManager) snapshotForReconnect() (uint64, map[string]DBConfig) {
 	return pm.generation, failed
 }
 
-// dial открывает и пингует соединение для одной БД. Не трогает состояние
-// poolManager — вызывающий сам решает что делать с результатом. Дозвон
-// намеренно вынесен из-под лока (может занимать секунды на каждую БД).
+// dial открывает и пингует соединение. Не трогает состояние poolManager —
+// вызывающий сам решает что делать с результатом.
 func (pm *poolManager) dial(name string, dbCfg DBConfig) (*sql.DB, bool) {
 	driver := strings.TrimSpace(dbCfg.Driver)
 	if driver == "" {
@@ -95,19 +89,15 @@ func (pm *poolManager) dial(name string, dbCfg DBConfig) (*sql.DB, bool) {
 	return db, true
 }
 
-// applyConfig реконсилирует пулы с только что загруженным набором конфигов БД.
-// Коммитит pools/failedPools/generation атомарно в одном критическом участке
-// (см. комментарий у типа). Сам дозвон идёт ВНЕ лока — под локом только
-// работа с map.
+// applyConfig реконсилирует пулы с новым набором конфигов БД.
 //
-// Возвращает:
-//   - toClose — пулы, которые были заменены или удалены и должны быть закрыты
-//     ВЫЗЫВАЮЩИМ после того как он убедится что ни один воркер их больше не
-//     использует (см. app.reload — реконсиляция воркеров обязана произойти
-//     до Close()).
-//   - removedDBs — имена БД, которые пропали из конфига целиком (нужно
-//     вызывающему чтобы дополнительно почистить их pool-метрики).
+// toClose — пулы к закрытию; вызывающий обязан сначала остановить воркеры,
+// использующие эти пулы, и только потом закрыть их (см. app.reload).
+// removedDBs — БД, пропавшие из конфига целиком.
 func (pm *poolManager) applyConfig(dbs map[string]DBConfig) (toClose map[string]*dbPool, removedDBs []string) {
+	pm.transitionMu.Lock()
+	defer pm.transitionMu.Unlock()
+
 	toClose = make(map[string]*dbPool)
 	current := pm.snapshotPools()
 
@@ -128,17 +118,10 @@ func (pm *poolManager) applyConfig(dbs map[string]DBConfig) (toClose map[string]
 			old.cfg.HealthCheckPeriod != dbCfg.HealthCheckPeriod
 
 		if !needUpdate {
-			// exists здесь всегда true — needUpdate == !exists || ..., поэтому
-			// !needUpdate логически влечёт exists (де Морган). Явную проверку
-			// убрали по замечанию статического анализатора: она была мертвым
-			// кодом, а не защитой от реального случая.
 			if old.cfg.Env != dbCfg.Env {
-				// Только Env изменился — реконнект не нужен (тот же *sql.DB),
-				// но мутировать old.cfg.Env "на месте" нельзя: это shared
-				// указатель, который воркеры могут читать из другой горутины
-				// без синхронизации. Новая обёртка с тем же *sql.DB естественно
-				// сработает через poolChanged в workerManager.reconcile —
-				// воркеры перезапустятся и подхватят новое значение env.
+				// Меняем только обёртку, не old.cfg.Env на месте — old может
+				// читаться из другой горутины без синхронизации. Новый
+				// указатель сработает через poolChanged в reconcile.
 				newPools[name] = &dbPool{cfg: dbCfg, db: old.db}
 				continue
 			}
@@ -148,10 +131,8 @@ func (pm *poolManager) applyConfig(dbs map[string]DBConfig) (toClose map[string]
 
 		db, ok := pm.dial(name, dbCfg)
 		if !ok {
-			// Не удалось создать новый пул — старый пул НЕ закрываем.
-			// Воркеры продолжают работать с существующим подключением.
 			if exists {
-				newPools[name] = old
+				newPools[name] = old // старое соединение продолжает работать
 			}
 			newFailed[name] = dbCfg
 			continue
@@ -172,19 +153,10 @@ func (pm *poolManager) applyConfig(dbs map[string]DBConfig) (toClose map[string]
 			}
 		}
 	}
+	// newFailed уже полон: applyConfig проходит по ВСЕМ БД желаемого
+	// состояния каждый раз, поэтому мержить с прошлым failedPools не нужно.
 	pm.pools = newPools
-	for name, cfg := range newFailed {
-		pm.failedPools[name] = cfg
-	}
-	for name := range pm.failedPools {
-		if _, connected := newPools[name]; connected {
-			delete(pm.failedPools, name) // успешно (пере)подключились в этом же applyConfig
-			continue
-		}
-		if _, stillInCfg := dbs[name]; !stillInCfg {
-			delete(pm.failedPools, name) // БД убрали из конфига целиком
-		}
-	}
+	pm.failedPools = newFailed
 	pm.generation++
 	pm.mu.Unlock()
 
@@ -193,10 +165,7 @@ func (pm *poolManager) applyConfig(dbs map[string]DBConfig) (toClose map[string]
 	return toClose, removedDBs
 }
 
-// updateDBUpMetrics публикует app_db_up для каждой известной БД: 1 если пул
-// сейчас рабочий, 0 если БД в failedPools. В отличие от app_query_up (которой
-// может не существовать вообще, если ни один воркер для этой БД не стартовал)
-// app_db_up есть для каждой БД из конфига всегда.
+// updateDBUpMetrics публикует app_db_up для каждой известной БД.
 func (pm *poolManager) updateDBUpMetrics() {
 	pools := pm.snapshotPools()
 	_, failed := pm.snapshotForReconnect()
@@ -208,23 +177,18 @@ func (pm *poolManager) updateDBUpMetrics() {
 	}
 }
 
-// commitReconnect проверяет завершённую попытку дозвона против ТЕКУЩЕГО
-// состояния перед применением и возвращает пул, который нужно закрыть в
-// результате замены (если есть). ok=false означает что попытка устарела и
-// должна быть отброшена — тогда вызывающий обязан сам закрыть переданный db.
+// commitReconnect проверяет попытку дозвона против текущего состояния перед
+// применением. ok=false — попытка устарела, вызывающий сам закрывает db.
 func (pm *poolManager) commitReconnect(name string, dbCfg DBConfig, expectedGen uint64, db *sql.DB) (oldPool *dbPool, ok bool) {
+	pm.transitionMu.Lock()
+	defer pm.transitionMu.Unlock()
+
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
 	if pm.generation != expectedGen {
 		return nil, false
 	}
-	// Дополнительная проверка сверх generation: конкретная запись в
-	// failedPools для этой БД должна быть именно той, для которой мы
-	// дозванивались. Структурно это уже гарантировано проверкой generation
-	// (оба мутируются только вместе), но сравнение по значению здесь ничего
-	// не стоит и защищает от будущих рефакторингов, которые могли бы это
-	// инвариант ненамеренно нарушить.
 	current, stillFailed := pm.failedPools[name]
 	if !stillFailed || current != dbCfg {
 		return nil, false
@@ -236,9 +200,7 @@ func (pm *poolManager) commitReconnect(name string, dbCfg DBConfig, expectedGen 
 	return oldPool, true
 }
 
-// closePools закрывает переданный набор пулов. Единственное место в коде,
-// которое вызывает sql.DB.Close() — весь остальной код должен просить об
-// этом poolManager, а не делать это самостоятельно.
+// closePools — единственное место, вызывающее sql.DB.Close().
 func (pm *poolManager) closePools(pools map[string]*dbPool) {
 	for name, p := range pools {
 		if p != nil && p.db != nil {
@@ -248,14 +210,10 @@ func (pm *poolManager) closePools(pools map[string]*dbPool) {
 	}
 }
 
-// closeAll закрывает все текущие пулы — используется при graceful shutdown.
 func (pm *poolManager) closeAll() {
 	pm.closePools(pm.snapshotPools())
 }
 
-// deletePoolMetrics чистит pool-gauge метрики для перечисленных БД — иначе
-// они остаются на /metrics навсегда с последним известным значением после
-// того как БД убрали из конфига.
 func (pm *poolManager) deletePoolMetrics(names []string) {
 	for _, name := range names {
 		dbPoolAcquired.DeleteLabelValues(name)
@@ -265,8 +223,6 @@ func (pm *poolManager) deletePoolMetrics(names []string) {
 	}
 }
 
-// metricsUpdater периодически публикует метрики состояния пулов (acquired/
-// idle/total connections) для всех текущих БД.
 func (pm *poolManager) metricsUpdater(period time.Duration) {
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()

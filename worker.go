@@ -26,7 +26,6 @@ func startQueryWorker(
 ) {
 	defer wg.Done()
 
-	// metricName — чистое имя метрики без суффикса __db для логов
 	metricName := queryCfg.MetricName
 	if metricName == "" {
 		metricName = name
@@ -39,19 +38,15 @@ func startQueryWorker(
 	}
 
 	runner := newSingleRunner(ctx, logger, name, prevLabels)
-	// Отменяем И ждём завершения текущего запроса перед выходом. Раньше здесь
-	// был только runner.cancelCurrent() без Wait() — outer wg.Done() (см. верх
-	// функции) срабатывал сразу, а caller (reconcileWorkers/stopAllWorkers),
-	// дождавшись только wg.Wait(), считал воркер полностью остановленным и мог
-	// unregister-ить метрику или запустить новый воркер с тем же prevLabels
-	// указателем, пока старая горутина ещё дописывает результат — гонка данных
-	// по *prevLabels и возможная запись в уже отозванный Prometheus-коллектор.
+	// Отменяем И ждём завершения — без Wait() wg.Done() выше срабатывал бы
+	// раньше, чем действительно заканчивается текущий запрос, и caller мог
+	// unregister-ить метрику или переиспользовать prevLabels пока старая
+	// горутина ещё пишет в них.
 	defer func() {
 		runner.cancelCurrent()
 		runner.currentWg.Wait()
 	}()
 
-	// --- Scheduled mode ---
 	if queryCfg.Schedule != nil {
 		loc, entries, err := parseSchedule(queryCfg.Schedule)
 		if err != nil {
@@ -75,7 +70,6 @@ func startQueryWorker(
 		}
 	}
 
-	// --- Interval mode ---
 	interval, err := time.ParseDuration(queryCfg.Interval)
 	if err != nil {
 		logger.Error("invalid interval, worker stopped", "query", metricName, "db", queryCfg.DB, "error", err)
@@ -87,9 +81,8 @@ func startQueryWorker(
 
 	logger.Info("started interval query worker", "query", metricName, "db", queryCfg.DB)
 
-	// Выполняем первый запрос сразу, не дожидаясь первого тика — иначе
-	// /metrics остаётся пустым до interval секунд после каждого старта Pod
-	// или после каждого рестарта воркера из-за изменения конфига.
+	// Первый запуск сразу, не дожидаясь тика — иначе /metrics пуст до
+	// interval секунд после каждого старта/рестарта воркера.
 	runner.run(queryCfg, db, timeout)
 
 	for {
@@ -103,15 +96,8 @@ func startQueryWorker(
 	}
 }
 
-// =========================================================================
-// singleRunner
-// =========================================================================
-
-// singleRunner гарантирует что в каждый момент времени выполняется не более одного запроса.
-// При вызове run() предыдущий запрос отменяется через context, новый запускается в горутине.
-//
-// Также хранит prevLabels — набор prometheus.Labels последнего успешного multi-row запуска.
-// При следующем запуске мы сравниваем его с текущим результатом и удаляем исчезнувшие строки.
+// singleRunner гарантирует не более одного выполнения запроса одновременно:
+// run() отменяет предыдущий и запускает новый в горутине.
 type singleRunner struct {
 	parentCtx     context.Context
 	logger        *slog.Logger
@@ -119,11 +105,9 @@ type singleRunner struct {
 	cancelCurrent context.CancelFunc
 	currentWg     sync.WaitGroup
 
-	// prevLabels — указатель на срез лейблов последнего успешного multi-row запуска.
-	// Указатель (а не значение) позволяет передавать состояние между воркерами при hot-reload:
-	// старый воркер и новый смотрят на одну и ту же память.
-	// Доступ безопасен: cancelCurrent+Wait гарантируют что старая горутина завершилась
-	// до того как новая начнёт читать/писать prevLabels.
+	// prevLabels — указатель, а не значение: старый и новый воркер при
+	// hot-reload смотрят на одну память. cancelCurrent+Wait гарантируют,
+	// что старая горутина закончила до того как новая начнёт её читать/писать.
 	prevLabels *[]prometheus.Labels
 }
 
@@ -155,13 +139,8 @@ func (r *singleRunner) run(queryCfg QueryConfig, db *sql.DB, timeout time.Durati
 	}()
 }
 
-// =========================================================================
-// runOnce
-// =========================================================================
-
-// runOnce выполняет один запуск запроса и возвращает обновлённый срез prevLabels
-// (для multi-row) или nil (для single-value).
-// prevLabels используется для reconciliation — удаления метрик исчезнувших строк.
+// runOnce выполняет один запуск и возвращает обновлённый prevLabels
+// (multi-row) или nil (single-value) для reconciliation.
 func runOnce(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -173,13 +152,9 @@ func runOnce(
 ) (nextPrevLabels []prometheus.Labels) {
 	start := time.Now()
 
-	// metricName — имя метрики в Prometheus.
-	// Для запросов клонированных под несколько БД MetricName содержит
-	// оригинальное имя без суффикса __db, чтобы метрики были чистыми.
-	// name (ключ воркера) может содержать суффикс для уникальности.
 	metricName := queryCfg.MetricName
 	if metricName == "" {
-		metricName = name // фолбэк для обратной совместимости
+		metricName = name
 	}
 
 	queryCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -207,8 +182,7 @@ func runOnce(
 		queryUp.WithLabelValues(metricName, queryCfg.DB).Set(0)
 		logger.Error("query failed", "query", metricName, "db", queryCfg.DB, "reason", reason, "error", runErr)
 
-		metric, exists := lookupQueryMetric(metricName)
-		if exists {
+		if metric, exists := lookupQueryMetric(metricName); exists {
 			for _, lbl := range prevLabels {
 				metric.Delete(lbl)
 			}
@@ -223,11 +197,8 @@ func runOnce(
 	return nextPrevLabels
 }
 
-// classifyError определяет причину ошибки для лейбла reason в queryErrors.
-//
-//   - "cancelled" — запрос отменён следующим тиком (ctx.Err() == Canceled)
-//   - "timeout"   — превышен таймаут (queryCtx истёк: DeadlineExceeded)
-//   - "db_error"  — ошибка на стороне БД
+// classifyError: "cancelled" (отменён следующим тиком) | "timeout"
+// (queryCtx истёк) | "db_error" (остальное).
 func classifyError(workerCtx, queryCtx context.Context) string {
 	if workerCtx.Err() == context.Canceled {
 		return "cancelled"
@@ -238,13 +209,7 @@ func classifyError(workerCtx, queryCtx context.Context) string {
 	return "db_error"
 }
 
-// =========================================================================
-// runSingleValue
-// =========================================================================
-
-// runSingleValue — оригинальное поведение: SELECT возвращает одну строку с одним числом.
-// При ошибке удаляет метрику из Prometheus — она пропадёт с графиков в Grafana.
-// При успехе — устанавливает значение обратно.
+// runSingleValue: SELECT возвращает одну строку с одним числом.
 func runSingleValue(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -254,9 +219,7 @@ func runSingleValue(
 ) error {
 	var result any
 	if err := db.QueryRowContext(ctx, queryCfg.SQL).Scan(&result); err != nil {
-		// Удаляем метрику — данные устарели
-		metric, exists := lookupQueryMetric(name)
-		if exists {
+		if metric, exists := lookupQueryMetric(name); exists {
 			metric.Delete(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil))
 		}
 		return err
@@ -264,13 +227,9 @@ func runSingleValue(
 
 	value, ok := toFloat64(result)
 	if !ok {
-		// Раньше return nil здесь тоже НЕ удалял старую строку — так же как
-		// не выставлял queryUp=0 (см. фикс ниже про numeric). Расхождение с
-		// путём ошибки Scan() (который строку удаляет) означало что
-		// app_query_up=0, а бизнес-метрика молча оставалась со старым
-		// значением — вводящее в заблуждение расхождение состояний.
-		metric, exists := lookupQueryMetric(name)
-		if exists {
+		// Удаляем строку и здесь тоже — иначе app_query_up=0, а бизнес-метрика
+		// молча остаётся со старым значением (расхождение с путём ошибки Scan()).
+		if metric, exists := lookupQueryMetric(name); exists {
 			metric.Delete(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil))
 		}
 		return fmt.Errorf("query result is not numeric: %T", result)
@@ -280,12 +239,9 @@ func runSingleValue(
 	if err != nil {
 		return err
 	}
-	// GetMetricWith вместо With: With паникует если переданный набор лейблов
-	// не совпадает со схемой, с которой GaugeVec был создан. Такое возможно
-	// не только сразу при создании — getOrCreateQueryMetric может вернуть уже
-	// существующий закэшированный коллектор чья схема была зафиксирована
-	// раньше при других обстоятельствах. GetMetricWith в этом случае просто
-	// возвращает ошибку — как и любая другая ошибка запроса, а не крашит процесс.
+	// GetMetricWith, не With: With паникует при несовпадении лейблов со
+	// схемой коллектора (возможно если getOrCreateQueryMetric вернул уже
+	// существующий, зафиксированный ранее коллектор).
 	gauge, err := metric.GetMetricWith(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil))
 	if err != nil {
 		return fmt.Errorf("label set mismatch for metric %q: %w", name, err)
@@ -296,35 +252,20 @@ func runSingleValue(
 	return nil
 }
 
-// =========================================================================
-// runMultiRow
-// =========================================================================
-
-// defaultMaxRows — лимит строк multi-row запроса, если max_rows не задан в
-// конфиге. Защита от непреднамеренного unbounded cardinality: SELECT без
-// GROUP BY/LIMIT над большой таблицей может вернуть миллионы строк, каждая
-// из которых становится отдельным Prometheus time series — это реальный
-// путь к OOM, который никак не лечится тюнингом GOGC/GOMEMLIMIT, потому что
-// проблема не в поведении GC, а в количестве живых объектов, которые GC
-// обязан держать живыми по прямому указанию программы.
+// defaultMaxRows — лимит строк multi-row запроса, если max_rows не задан.
+// Без лимита SELECT без GROUP BY/LIMIT может вернуть миллионы time series
+// и привести к OOM — GOGC/GOMEMLIMIT здесь не помогают, поскольку проблема
+// не в поведении GC, а в количестве живых объектов.
 const defaultMaxRows = 10000
 
-// runMultiRow выполняет SELECT с несколькими строками. Каждая строка становится
-// отдельным time series в Prometheus. Столбцы кроме value_column — лейблы.
+// runMultiRow выполняет SELECT с несколькими строками — каждая становится
+// отдельным time series. Столбцы кроме value_column — лейблы.
 //
-// Работает в два прохода:
-//  1. Read — читает и буферизует ВСЕ строки результата в памяти (до max_rows).
-//     Если строк больше лимита — прерывается сразу с ошибкой, НЕ трогая
-//     Prometheus вообще: частично прочитанный или переполненный результат
-//     не должен попасть в метрики частично, иначе после failed запроса
-//     на графиках останется случайный обрубок данных.
-//  2. Commit — только после того как ВЕСЬ результат успешно прочитан и
-//     находится в пределах лимита, записывает буфер в Prometheus и удаляет
-//     устаревшие (пропавшие) строки через reconciliation по prevLabels.
-//
-// Reconciliation: сравниваем текущий набор лейблов с prevLabels.
-// Строки, которые были в прошлом запуске но отсутствуют в текущем — удаляются из метрики.
-// Это обеспечивает что пропавшие из БД строки пропадают и с графиков Grafana.
+// Двухфазно: Read буферизует все строки в памяти (до max_rows), ничего не
+// записывая в Prometheus; Commit пишет буфер только если ВЕСЬ результат
+// прочитан успешно и в пределах лимита. Без этого разделения ошибка на
+// середине результата (лимит, несовместимая схема) оставляла бы половину
+// строк записанными, а половину нет.
 func runMultiRow(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -348,7 +289,6 @@ func runMultiRow(
 		return nil, err
 	}
 
-	// Находим индекс value_column
 	valueColIdx := -1
 	for i, col := range colNames {
 		if strings.EqualFold(col, queryCfg.ValueColumn) {
@@ -361,7 +301,6 @@ func runMultiRow(
 			queryCfg.ValueColumn, colNames)
 	}
 
-	// Имена столбцов-лейблов = все столбцы кроме value_column
 	colLabelNames := make([]string, 0, len(colNames)-1)
 	for i, col := range colNames {
 		if i != valueColIdx {
@@ -369,12 +308,10 @@ func runMultiRow(
 		}
 	}
 
-	// Защита от коллизии имён лейблов: если SQL-столбец называется "db"/"env"
-	// (лейблы которые приложение проставляет само) или совпадает с именем
-	// статического лейбла из labels:, buildLabelValues молча перезаписал бы
-	// одно значение другим при заполнении map. Без этой проверки данные в
-	// метрике были бы незаметно неверными. Проверить заранее на этапе конфига
-	// нельзя — имена столбцов известны только после выполнения запроса.
+	// Имена столбцов известны только после выполнения запроса, поэтому не
+	// могут быть провалидированы на этапе конфига — проверяем здесь: и на
+	// коллизию с зарезервированными/статическими лейблами, и на валидность
+	// как имя лейбла Prometheus.
 	seenLabelNames := make(map[string]struct{}, len(colLabelNames)+len(queryCfg.Labels)+2)
 	seenLabelNames["db"] = struct{}{}
 	seenLabelNames["env"] = struct{}{}
@@ -386,11 +323,6 @@ func runMultiRow(
 			return nil, fmt.Errorf("column %q collides with a reserved or static label name", col)
 		}
 		seenLabelNames[col] = struct{}{}
-		// Имена столбцов известны только после выполнения запроса, поэтому
-		// не могут быть провалидированы на этапе конфига (в отличие от
-		// статических labels: — те уже проверены в config.go). Без этой
-		// проверки столбец вроде "user-id" доехал бы до getOrCreateQueryMetric
-		// и упал бы там с гораздо менее очевидной ошибкой регистрации метрики.
 		if !isValidPrometheusLabelName(col) {
 			return nil, fmt.Errorf("column %q is not a valid Prometheus label name", col)
 		}
@@ -401,7 +333,7 @@ func runMultiRow(
 		maxRows = defaultMaxRows
 	}
 
-	// --- Фаза 1: Read — буферизуем в памяти, ничего не пишем в Prometheus ---
+	// --- Read ---
 
 	scanBuf := make([]any, len(colNames))
 	scanPtrs := make([]any, len(colNames))
@@ -415,24 +347,15 @@ func runMultiRow(
 	}
 	buffered := make([]bufferedRow, 0, 64)
 
-	// seenSeries детектит дубликаты комбинаций лейблов внутри ОДНОГО
-	// результата запроса — например SQL без корректного GROUP BY вернул
-	// одну и ту же комбинацию (region, status) дважды с разными value.
-	// Без этой проверки строки просто шли бы в буфер подряд, а на фазе
-	// Commit ниже gauge.Set() для одной и той же серии вызывался бы
-	// дважды — молча побеждает последняя строка, результат зависит от
-	// порядка возврата строк сервером БД (который без явного ORDER BY
-	// не гарантирован). Для exporter'а такая неоднозначность почти
-	// всегда означает ошибку в самом SQL, а не что-то ожидаемое.
+	// seenSeries детектит дубликаты комбинаций лейблов внутри одного
+	// результата (SQL без корректного GROUP BY) — без этого последняя
+	// строка молча побеждала бы, а исход зависел от недетерминированного
+	// порядка возврата строк БД.
 	seenSeries := make(map[string]struct{}, 64)
 
-	// rowsRead считает КАЖДУЮ прочитанную строку, а не только те что успешно
-	// распарсились в число. Раньше лимит проверялся через len(buffered), который
-	// растёт только при удачном toFloat64 — запрос возвращающий миллионы строк
-	// с нечисловым value_column проходил бы этот лимит насквозь: len(buffered)
-	// оставался бы 0 сколько бы строк ни было прочитано. rowsRead считает то,
-	// что реально прошло через rows.Next(), независимо от того распарсилось ли
-	// значение — это и есть защита от runaway query, а не от runaway metric count.
+	// rowsRead считает каждую прочитанную строку, не только успешно
+	// распарсенные в число — иначе лимит обходился бы запросом с миллионами
+	// нечисловых строк (len(buffered) остался бы нулевым).
 	rowsRead := 0
 
 	for rows.Next() {
@@ -487,19 +410,16 @@ func runMultiRow(
 		logger.Warn("query returned 0 rows", "query", name, "db", queryCfg.DB)
 	}
 
-	// --- Фаза 2: Commit — весь результат успешно прочитан и в пределах лимита ---
+	// --- Commit ---
 
 	metric, err := getOrCreateQueryMetric(name, queryCfg.Labels, colLabelNames)
 	if err != nil {
 		return nil, err
 	}
 
-	// Сначала резолвим ВСЕ gauge-хендлы через GetMetricWith (не паникующий With),
-	// и только если ВСЕ строки успешно резолвились — делаем Set(). Если бы мы
-	// делали Set() сразу в цикле резолва, ошибка на середине результата
-	// (например схема лейблов несовместима с уже закэшированным коллектором)
-	// оставила бы половину строк записанными, а половину — нет, то есть тот
-	// же partial-write эффект который мы и убираем этим редизайном.
+	// Сначала резолвим все gauge-хендлы, и только если ВСЕ успешны — Set().
+	// Иначе ошибка на середине (несовместимая схема) оставила бы часть
+	// строк записанными.
 	gauges := make([]prometheus.Gauge, len(buffered))
 	for i, row := range buffered {
 		g, err := metric.GetMetricWith(row.labels)
@@ -517,10 +437,8 @@ func runMultiRow(
 		currentLabels[i] = row.labels
 	}
 
-	// Reconciliation: удаляем строки которые были в прошлом запуске но исчезли сейчас.
-	// seenSeries уже содержит ровно те же ключи, что понадобились бы здесь —
-	// buffered по построению не содержит дублей (см. проверку выше), так что
-	// повторно строить набор не нужно.
+	// Удаляем строки прошлого запуска, отсутствующие в текущем. seenSeries
+	// уже содержит нужные ключи — buffered без дублей по построению.
 	for _, lbl := range prevLabels {
 		if _, exists := seenSeries[labelsKey(lbl)]; !exists {
 			metric.Delete(lbl)
@@ -531,18 +449,13 @@ func runMultiRow(
 	return currentLabels, nil
 }
 
-// labelsKey строит стабильный строковый ключ из prometheus.Labels.
-// Ключи сортируются явно — порядок итерации по map в Go не гарантирован,
-// и fmt.Sprintf("%v", map) не обеспечивает стабильности между вызовами.
+// labelsKey строит стабильный ключ из Labels (сортировка — порядок
+// итерации по map не гарантирован).
 //
-// Кодирование — length-prefixed (в духе Netstring: "<длина>:<байты>"), не
-// через разделители вроде "key=value,key=value". Разделительное кодирование
-// небезопасно: значение лейбла само может содержать "," или "=" (например
-// TEXT_VALUE со вложенным JSON), и тогда две РАЗНЫЕ комбинации лейблов
-// могли бы сериализоваться в одну и ту же строку — reconciliation молча
-// перепутал бы, какую строку удалять. Явная длина перед каждым компонентом
-// делает разбор однозначным независимо от содержимого — коллизия
-// принципиально невозможна, а не просто маловероятна.
+// Length-prefixed кодирование ("<длина>:<байты>"), не разделители типа
+// "key=value,key=value": значение лейбла само может содержать "," или "="
+// (например JSON), и тогда разные комбинации лейблов сериализовались бы
+// в одну строку. Явная длина делает коллизию невозможной, а не маловероятной.
 func labelsKey(lbl prometheus.Labels) string {
 	keys := make([]string, 0, len(lbl))
 	for k := range lbl {
@@ -562,10 +475,6 @@ func labelsKey(lbl prometheus.Labels) string {
 	}
 	return sb.String()
 }
-
-// =========================================================================
-// helpers
-// =========================================================================
 
 func anyToString(v any) string {
 	if v == nil {

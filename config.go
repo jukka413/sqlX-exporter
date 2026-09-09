@@ -14,20 +14,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// unmarshalYAMLStrict парсит YAML в строгом режиме: yaml.v3.Decoder.KnownFields(true)
-// проверяет что каждый встреченный ключ соответствует полю структуры-получателя.
-// Опечатка вида "max_conn_lifetme" вместо "max_conn_lifetime" раньше молча
-// игнорировалась (значение просто отбрасывалось, поле оставалось со значением
-// по умолчанию) — теперь это явная ошибка загрузки конфига с указанием файла.
-// Map-поля (Labels, Databases, Queries и т.п.) не затронуты — KnownFields
-// проверяет только соответствие ИМЁН СТРУКТУРНЫХ полей, а не произвольные
-// ключи внутри map, у которых нет фиксированной схемы.
-//
-// io.EOF от Decode() — не ошибка, а нормальный результат для пустого или
-// состоящего только из комментариев файла (в отличие от yaml.Unmarshal,
-// Decoder.Decode() именно так сигнализирует "документов не найдено"). Файл
-// с одними комментариями раньше прекрасно парсился в нулевое значение —
-// без этой проверки он стал бы ошибкой загрузки конфига.
+// unmarshalYAMLStrict парсит YAML с KnownFields(true) — опечатка в имени
+// поля становится явной ошибкой, а не молча отброшенным значением.
+// io.EOF от Decode() (пустой/закомментированный файл) не считается ошибкой.
 func unmarshalYAMLStrict(data []byte, out any) error {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -40,97 +29,42 @@ func unmarshalYAMLStrict(data []byte, out any) error {
 type Config struct {
 	Settings AppSettings `yaml:"settings"`
 
-	// DefaultDB — локальная БД по умолчанию для запросов в этом файле.
-	// Если не указан — используется parentDefaultDB от родителя или settings.default_db.
+	// DefaultDB — default_db для запросов в этом файле; если пусто, берётся
+	// от родителя или из settings.default_db.
 	DefaultDB string `yaml:"default_db,omitempty"`
 
-	// IncludeDefaults — маппинг имени инклюд-файла к одной или нескольким БД по умолчанию.
-	// Позволяет централизованно задать default_db для каждого файла с метриками
-	// не дублируя его внутри самих файлов.
-	//
-	// Один файл — одна БД:
-	//   include_defaults:
-	//     oracle-metrics.yaml: "azdh_oracle"
-	//
-	// Один файл — несколько БД (запросы клонируются для каждой):
-	//   include_defaults:
-	//     oracle-metrics.yaml:
-	//       - "azdh_oracle"
-	//       - "ir_test_oracle"
+	// IncludeDefaults — БД по умолчанию для инклюд-файла (одна или несколько,
+	// см. IncludeDefault). Позволяет не дублировать db: в каждом запросе.
 	IncludeDefaults map[string]IncludeDefault `yaml:"include_defaults,omitempty"`
 
-	// Includes — карта путей к дополнительным конфиг файлам.
-	// Ключ — произвольное имя (для удобства в values файлах), значение — true.
-	// Map вместо списка специально: при мерже нескольких Helm values файлов
-	// Helm делает глубокий мерж map-полей, но ПОЛНОСТЬЮ заменяет списки.
-	// Со списком второй values файл стирал includes первого; с map — оба
-	// набора ключей объединяются автоматически.
-	//
-	// Пример в values:
-	//   config:
-	//     includes:
-	//       "oracle.yaml": true
-	//       "mssql.yaml": true
+	// Includes — map, не список: Helm глубоко мержит map-поля между
+	// несколькими values файлами, но полностью заменяет списки.
 	Includes map[string]bool `yaml:"includes,omitempty"`
 
 	Databases map[string]DBConfig    `yaml:"databases"`
 	Queries   map[string]QueryConfig `yaml:"queries"`
 
-	// skippedIncludes — список файлов из includes которые были проигнорированы
-	// потому что для них не нашлось записи в include_defaults.
-	// Не из YAML — заполняется кодом при загрузке, для логирования в app.go.
-	skippedIncludes []string `yaml:"-"`
-
-	// missingEnvVars — список переменных окружения упомянутых в url через
-	// ${VAR}, которые не были найдены в окружении при загрузке. Не из YAML —
-	// заполняется кодом, для логирования в app.go. Без этого отсутствующая
-	// переменная тихо превращалась в пустой пароль и проявлялась только как
-	// загадочная ошибка аутентификации на стороне БД (например ORA-01017).
-	missingEnvVars []string `yaml:"-"`
-
-	// overwritten — список случаев когда инклюд перезаписал существующий
-	// database/query с другим значением. Не из YAML — заполняется кодом,
-	// для логирования в app.go. Без этого коллизия имён между двумя
-	// независимыми инклюд-файлами (например из разных Git-репозиториев)
-	// проходит абсолютно молча — метрика продолжает существовать под тем же
-	// именем, но начинает собирать данные с другой БД или по другому SQL.
-	overwritten []string `yaml:"-"`
-
-	// failedIncludes — список инклюдов, которые не удалось загрузить (файл
-	// не найден, битый YAML и т.п.). Не из YAML — заполняется кодом, для
-	// логирования в app.go. Раньше такая ошибка была фатальной для ВСЕГО
-	// reload() — один сломанный инклюд блокировал применение изменений даже
-	// в файлах, никак с ним не связанных. Теперь конкретно этот инклюд
-	// пропускается (его databases/queries просто отсутствуют в итоговом
-	// конфиге), а все остальные файлы применяются как обычно.
-	failedIncludes []string `yaml:"-"`
-
-	// dependencies — абсолютные пути ВСЕХ файлов, которые были реально
-	// прочитаны при сборке этого конфига (сам файл + все успешно
-	// загруженные инклюды, рекурсивно). Не из YAML — заполняется кодом.
-	// Нужно watcher'у: раньше директории для отслеживания собирались
-	// ОДИН раз при старте процесса (main.collectIncludeDirs) — новый
-	// инклюд, добавленный через hot-reload в директорию, которая ещё не
-	// отслеживалась, был не виден watcher'у до рестарта Pod'а. Теперь
-	// после каждого reload список пересчитывается из фактически прочитанных
-	// файлов, а не из статического снимка на старте.
-	dependencies []string `yaml:"-"`
+	// Ниже — не из YAML, заполняется кодом при загрузке, читается в app.go
+	// для логирования и построения списка watch-директорий.
+	skippedIncludes []string `yaml:"-"` // инклюд без записи в include_defaults
+	missingEnvVars  []string `yaml:"-"` // ${VAR} не найдена в окружении
+	overwritten     []string `yaml:"-"` // database/query перезаписаны другим инклюдом
+	failedIncludes  []string `yaml:"-"` // инклюд не удалось загрузить
+	dependencies    []string `yaml:"-"` // абсолютные пути всех прочитанных файлов
 }
 
-// IncludeDefault поддерживает как строку так и список строк в YAML:
+// IncludeDefault поддерживает строку и список строк в YAML:
 //
-//	oracle-metrics.yaml: "azdh_oracle"          → ["azdh_oracle"]
-//	oracle-metrics.yaml: ["azdh_oracle", "ir_test_oracle"] → ["azdh_oracle", "ir_test_oracle"]
+//	oracle-metrics.yaml: "azdh_oracle"
+//	oracle-metrics.yaml: ["azdh_oracle", "ir_test_oracle"]
 type IncludeDefault []string
 
 func (id *IncludeDefault) UnmarshalYAML(value *yaml.Node) error {
-	// Пробуем как строку
 	var single string
 	if err := value.Decode(&single); err == nil {
 		*id = IncludeDefault{single}
 		return nil
 	}
-	// Пробуем как список
 	var multi []string
 	if err := value.Decode(&multi); err == nil {
 		*id = IncludeDefault(multi)
@@ -139,20 +73,13 @@ func (id *IncludeDefault) UnmarshalYAML(value *yaml.Node) error {
 	return fmt.Errorf("include_defaults value must be a string or list of strings")
 }
 
-// AppSettings — глобальные настройки приложения.
 type AppSettings struct {
 	DBReconnectInterval string `yaml:"db_reconnect_interval,omitempty"`
 	DefaultDB           string `yaml:"default_db,omitempty"`
 
-	// Дефолты пула соединений — применяются к каждой БД из databases:, у
-	// которой соответствующее поле не задано явно. Имена ключей совпадают
-	// с полями DBConfig намеренно — секции settings: и databases.<name>:
-	// это разные структуры, коллизии имён в YAML нет, а совпадение имён
-	// делает переопределение интуитивным ("то же поле, но конкретно для
-	// этой БД"). Резолвятся в applyDefaultPoolSettings один раз, после
-	// того как domain settings полностью смержены из всех инклюдов —
-	// раньше делать нельзя: более поздний инклюд может переопределить
-	// сам дефолт, и резолвить его нужно уже финальным значением.
+	// Дефолты пула для databases: — применяются в applyDefaultPoolSettings,
+	// когда БД не задаёт поле явно. Имена ключей совпадают с полями
+	// DBConfig намеренно, для интуитивного переопределения.
 	DefaultMaxConns        int    `yaml:"max_conns,omitempty"`
 	DefaultMaxIdleConns    int    `yaml:"max_idle_conns,omitempty"`
 	DefaultMaxConnLifetime string `yaml:"max_conn_lifetime,omitempty"`
@@ -174,10 +101,8 @@ type DBConfig struct {
 	Driver string `yaml:"driver"`
 	URL    string `yaml:"url"`
 
-	// Env — окружение этой БД (prod, test, dev и т.д.). Если задано,
-	// автоматически добавляется как лейбл "env" ко всем метрикам,
-	// использующим эту БД — не нужно прописывать labels: env вручную
-	// в каждом запросе. Опционально: если не задано, лейбл env не добавляется.
+	// Env — если задано, автоматически становится лейблом "env" на всех
+	// метриках этой БД.
 	Env string `yaml:"env,omitempty"`
 
 	MaxConns     int `yaml:"max_conns"`
@@ -199,24 +124,17 @@ type QueryConfig struct {
 	Labels      map[string]string `yaml:"labels,omitempty"`
 	ValueColumn string            `yaml:"value_column,omitempty"`
 
-	// MaxRows — лимит строк для multi-row запросов (value_column задан).
-	// Защита от unbounded cardinality: без лимита SELECT без GROUP BY/LIMIT
-	// над большой таблицей может создать миллионы time series и привести к
-	// OOM. Если не задано (0), используется defaultMaxRows (см. worker.go).
-	// Игнорируется для single-value запросов.
+	// MaxRows — лимит строк для multi-row (защита от unbounded cardinality).
+	// 0 — берётся defaultMaxRows из worker.go. Игнорируется для single-value.
 	MaxRows int `yaml:"max_rows,omitempty"`
 
-	// MetricName — имя метрики в Prometheus.
-	// Заполняется автоматически при загрузке конфига — равно имени запроса.
-	// При клонировании для нескольких БД ключ воркера становится составным
-	// (name+db), но MetricName остаётся оригинальным именем запроса.
-	// Это позволяет иметь одинаковое имя метрики для разных БД без суффиксов.
-	MetricName string `yaml:"-"` // не читается из YAML, проставляется кодом
+	// MetricName — имя запроса до клонирования на несколько БД (worker key
+	// становится "name__db", MetricName остаётся чистым). Не из YAML.
+	MetricName string `yaml:"-"`
 
-	// DBEnv — значение databases.<db>.env для той БД, к которой привязан
-	// этот запрос. Не из YAML — проставляется в app.reconcileWorkers в момент
-	// резолва q.DB → *dbPool, потому что именно там впервые известны и запрос,
-	// и его пул одновременно. Пробрасывается в worker.go как лейбл "env".
+	// DBEnv — Env той БД, к которой резолвится запрос. Проставляется в
+	// workerManager.reconcile, не при загрузке — там впервые известна
+	// связка запрос→пул. Не из YAML.
 	DBEnv string `yaml:"-"`
 }
 
@@ -230,7 +148,7 @@ type ScheduleAt struct {
 	Time    string `yaml:"time"`
 }
 
-// loadConfig загружает конфиг из файла path и рекурсивно обрабатывает includes.
+// loadConfig загружает конфиг из path и рекурсивно обрабатывает includes.
 func loadConfig(path string) (Config, error) {
 	var preview Config
 	data, err := os.ReadFile(path)
@@ -256,14 +174,9 @@ func loadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-// applyDefaultPoolSettings проставляет дефолты пула из settings: в каждую БД,
-// у которой соответствующее поле не задано явно. Явное значение в самой БД
-// всегда имеет приоритет — эта функция только заполняет пробелы.
-//
-// Вызывается ПОСЛЕ полного мержа всех инклюдов (из loadConfig, не изнутри
-// loadConfigWithContext) — settings.* сами могут быть переопределены более
-// поздним инклюдом, резолвить дефолты нужно уже финальным значением, а не
-// тем что было в конкретном файле на момент его собственной загрузки.
+// applyDefaultPoolSettings проставляет дефолты пула из settings: в БД без
+// явного значения. Вызывается после полного мержа инклюдов — settings.*
+// сам может быть переопределён более поздним инклюдом.
 func applyDefaultPoolSettings(cfg *Config) {
 	s := cfg.Settings
 	for name, db := range cfg.Databases {
@@ -285,12 +198,9 @@ func applyDefaultPoolSettings(cfg *Config) {
 
 const maxIncludeDepth = 10
 
-// loadConfigWithContext загружает конфиг передавая контекст от родителя:
-//   - parentDefaultDB — глобальный default_db от родителя
-//   - parentIncludeDefaults — маппинг include_defaults от родителя
-//   - rootDir — директория основного (корневого) конфига; все инклюды должны
-//     резолвиться внутри неё, это защита от path traversal через includes
-//     (например includes: {"../../../etc/something.yaml": true})
+// loadConfigWithContext загружает один файл конфига и рекурсивно — его
+// инклюды. rootDir — директория корневого конфига; все инклюды обязаны
+// резолвиться внутри неё (защита от path traversal через "../..").
 func loadConfigWithContext(path string, depth int, parentDefaultDB string, parentIncludeDefaults map[string]IncludeDefault, rootDir string) (Config, error) {
 	var cfg Config
 
@@ -313,8 +223,7 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 
 	cfg.missingEnvVars = expandURLs(&cfg)
 
-	// Проставляем MetricName = имя запроса для каждого запроса.
-	// Это нужно до клонирования — при клонировании ключ изменится но MetricName останется.
+	// MetricName проставляется до клонирования на несколько БД.
 	for name, q := range cfg.Queries {
 		if q.MetricName == "" {
 			q.MetricName = name
@@ -322,47 +231,31 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 		}
 	}
 
-	// Определяем эффективный default_db для этого файла
 	effectiveDefaultDB := cfg.DefaultDB
 	if effectiveDefaultDB == "" {
 		effectiveDefaultDB = parentDefaultDB
 	}
-
-	// Применяем effectiveDefaultDB к запросам этого файла
 	if effectiveDefaultDB != "" {
 		applyDefaultDB(&cfg, effectiveDefaultDB)
 	}
 
-	// Мержим include_defaults — родительский + текущий файла
-	// (текущий имеет приоритет)
 	effectiveIncludeDefaults := mergeIncludeDefaults(parentIncludeDefaults, cfg.IncludeDefaults)
 
-	// Обрабатываем инклюды.
-	// Сортируем ключи для детерминированного порядка обработки —
-	// порядок итерации по map в Go не гарантирован, а порядок важен
-	// для приоритета при mergeConfig (последний обработанный — побеждает).
 	if len(cfg.Includes) > 0 {
 		baseDir := filepath.Dir(path)
 		includePaths := make([]string, 0, len(cfg.Includes))
 		for p := range cfg.Includes {
 			includePaths = append(includePaths, p)
 		}
-		sort.Strings(includePaths)
+		sort.Strings(includePaths) // детерминированный порядок мержа
 
 		for _, includePath := range includePaths {
-			// includes — map[string]bool. false означает "временно выключен" —
-			// пропускаем без загрузки, но и без включения в skippedIncludes
-			// (это осознанное отключение автором конфига, а не "забыли настроить").
 			if !cfg.Includes[includePath] {
-				continue
+				continue // явно выключен
 			}
 
 			fullPath := filepath.Join(baseDir, includePath)
 
-			// Path traversal guard: резолвленный путь должен оставаться внутри
-			// rootDir корневого конфига. Без этой проверки includes с "../.."
-			// мог бы читать произвольные файлы с того же volume, к которым
-			// у процесса есть доступ на чтение.
 			absFullPath, err := filepath.Abs(fullPath)
 			if err != nil {
 				return cfg, fmt.Errorf("include %q: cannot resolve absolute path: %w", includePath, err)
@@ -372,50 +265,25 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 				return cfg, fmt.Errorf("include %q resolves outside the config root directory %q", includePath, rootDir)
 			}
 
-			// Ищем запись в include_defaults сначала по полному include path
-			// (например "team-a/metrics.yaml"), и только если такой записи нет —
-			// по basename ("metrics.yaml") для обратной совместимости. Без этого
-			// приоритета "team-a/metrics.yaml" и "team-b/metrics.yaml" искали бы
-			// одну и ту же запись "metrics.yaml" и получили бы одинаковую БД.
+			// Сначала полный путь, потом basename — иначе team-a/x.yaml и
+			// team-b/x.yaml делили бы одну запись в include_defaults.
 			baseName := filepath.Base(includePath)
 			dbs, ok := effectiveIncludeDefaults[includePath]
 			if !ok {
 				dbs, ok = effectiveIncludeDefaults[baseName]
 			}
 			if !ok {
-				// Файл загружается ТОЛЬКО если для него есть запись в include_defaults.
-				// Без записи — файл осознанно игнорируется. Это позволяет держать
-				// файлы метрик переиспользуемыми: добавление файла в includes без
-				// include_defaults безопасно ничего не делает, а не падает с
-				// ошибкой "db is required".
 				cfg.skippedIncludes = append(cfg.skippedIncludes,
 					fmt.Sprintf("%q: no entry in include_defaults", includePath))
 				continue
 			}
 
-			// Загружаем файл для каждой БД и мержим. Если БД несколько — все
-			// запросы получают суффикс __db чтобы воркеры были уникальны.
-			// Лейбл db в метрике всё равно различает их в Prometheus.
 			addSuffix := len(dbs) > 1
 			for _, db := range dbs {
 				inc, err := loadConfigWithContext(fullPath, depth+1, db, effectiveIncludeDefaults, rootDir)
 				if err != nil {
-					// Раньше ошибка ЛЮБОГО инклюда (файл не найден, битый YAML)
-					// прерывала всю loadConfigWithContext — а значит и весь
-					// reload() целиком, включая совершенно не связанные с этим
-					// инклюдом файлы и метрики. На практике это выглядело так:
-					// один сломанный include-файл незаметно блокировал
-					// обновление ВСЕХ остальных метрик — при hot-reload
-					// оставалось работать старое состояние целиком, а при
-					// первом запуске процесса (после пересоздания Pod'а, когда
-					// откатываться ещё не на что) не работало вообще ничего.
-					// В логах при этом была только ошибка про один конкретный
-					// файл, что не объясняло, почему не обновились остальные.
-					//
-					// Теперь ошибка одного инклюда не мешает остальным —
-					// логируем и переходим к следующему, как уже делаем для
-					// query без записи в include_defaults (skippedIncludes)
-					// и для невалидных отдельных запросов (sanitizeQueries).
+					// Один сломанный инклюд не должен блокировать остальные —
+					// его databases/queries просто отсутствуют в итоге.
 					cfg.failedIncludes = append(cfg.failedIncludes,
 						fmt.Sprintf("%q (db=%s): %v", fullPath, db, err))
 					continue
@@ -424,7 +292,6 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 					inc = cloneQueriesForDB(inc, db)
 				}
 				mergeConfig(&cfg, inc, includePath)
-				// Переносим служебные списки из дочернего конфига наверх
 				cfg.skippedIncludes = append(cfg.skippedIncludes, inc.skippedIncludes...)
 				cfg.missingEnvVars = append(cfg.missingEnvVars, inc.missingEnvVars...)
 				cfg.overwritten = append(cfg.overwritten, inc.overwritten...)
@@ -438,8 +305,6 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 	return cfg, nil
 }
 
-// mergeIncludeDefaults мержит два маппинга include_defaults.
-// override имеет приоритет над base.
 func mergeIncludeDefaults(base, override map[string]IncludeDefault) map[string]IncludeDefault {
 	if len(base) == 0 && len(override) == 0 {
 		return nil
@@ -454,7 +319,6 @@ func mergeIncludeDefaults(base, override map[string]IncludeDefault) map[string]I
 	return result
 }
 
-// applyDefaultDB подставляет defaultDB в запросы без явного db.
 func applyDefaultDB(cfg *Config, defaultDB string) {
 	for name, q := range cfg.Queries {
 		if q.DB == "" {
@@ -464,45 +328,18 @@ func applyDefaultDB(cfg *Config, defaultDB string) {
 	}
 }
 
-// expandURLs подставляет переменные окружения только в поля url баз данных.
+// expandURLs подставляет переменные окружения в url баз данных. Отсутствующая
+// переменная (LookupEnv, не Getenv — различает "нет" от "пустая") собирается
+// в missingVars вместо тихой подстановки пустой строки.
 //
-// Кодирование значения зависит от драйвера (см. тело функции):
-//   - MySQL — не кодируется вообще, его DSN не является URL;
-//   - TNS-дескрипторы Oracle — не кодируются, иначе ломается их грамматика;
-//   - остальное — percent-кодирование через escapeURLComponent.
-//
-// Исключение — значения похожие на TNS-дескриптор Oracle:
-// "(DESCRIPTION=(ADDRESS=...)...)" — такие значения НЕ кодируются,
-// иначе скобки и = превратятся в %28 %29 %3D и resolveDSN не сможет
-// распознать и распарсить TNS-дескриптор в db.go.
-//
-// ВАЖНО (исправленный баг): раньше отсутствующая переменная окружения
-// (опечатка в имени, незапримонтированный Secret, неверный регистр —
-// например ${password} в конфиге vs PASSWORD в env) тихо подставлялась
-// как пустая строка через os.Getenv, который не различает "переменной нет
-// вообще" и "переменная есть, но реально пустая". В результате URL
-// собирался вида "oracle://user:@host:1521/service" — с пустым паролем —
-// без единой ошибки на этапе загрузки конфига. Дальше Oracle совершенно
-// ожидаемо отвечает ORA-01017 "invalid username/password" (соединение
-// доходит до сервера — поэтому не "connection refused", просто пустой
-// пароль действительно неверен), и по одному этому сообщению невозможно
-// понять, что переменная окружения вовсе не была найдена.
-//
-// Теперь используется os.LookupEnv, который явно возвращает найдена ли
-// переменная, и все ненайденные собираются в missingVars — для
-// предупреждения в логах при reload (см. вызов в app.go).
+// Кодирование зависит от драйвера: MySQL DSN не кодируется вообще (это не
+// URL, драйвер берёт пароль как есть — см. go-sql-driver/mysql docs), TNS-
+// дескрипторы Oracle не кодируются (иначе ломается их грамматика), остальное
+// — через escapeURLComponent.
 func expandURLs(cfg *Config) (missingVars []string) {
 	seen := make(map[string]struct{})
 
 	for name, db := range cfg.Databases {
-		// MySQL DSN — не URL: его грамматика "user:pass@tcp(host:port)/db"
-		// разбирается собственным парсером драйвера, который берёт пароль
-		// как есть, между первым ':' и последним '@'. Официальная документация
-		// go-sql-driver/mysql прямо говорит: "Passwords can consist of any
-		// character. Escaping is not necessary", а Config.FormatDSN пишет
-		// пароль в строку дословно. Любое percent-кодирование здесь не
-		// раскодируется никем и уходит в MySQL КАК ЧАСТЬ ПАРОЛЯ — то есть
-		// пароль "p@ss" превращался в "p%40ss" и аутентификация падала.
 		isMySQL := strings.EqualFold(strings.TrimSpace(db.Driver), "mysql")
 
 		db.URL = os.Expand(db.URL, func(key string) string {
@@ -515,16 +352,8 @@ func expandURLs(cfg *Config) (missingVars []string) {
 				}
 				return ""
 			}
-			if val == "" {
-				// Переменная явно задана как пустая строка — это может быть
-				// осознанным выбором, не считаем ошибкой и не предупреждаем.
-				return ""
-			}
-			if looksLikeTNSDescriptor(val) {
-				return val // подставляем как есть, без кодирования
-			}
-			if isMySQL {
-				return val // см. комментарий выше — MySQL DSN не URL
+			if val == "" || looksLikeTNSDescriptor(val) || isMySQL {
+				return val
 			}
 			return escapeURLComponent(val)
 		})
@@ -534,21 +363,9 @@ func expandURLs(cfg *Config) (missingVars []string) {
 	return missingVars
 }
 
-// escapeURLComponent percent-кодирует всё, кроме unreserved-символов RFC 3986
-// (ALPHA / DIGIT / "-" / "." / "_" / "~").
-//
-// Используется вместо url.QueryEscape, который предназначен для query-компонента
-// URL и кодирует пробел как "+". В userinfo (user:password@host) "+" — это
-// обычный литеральный символ, а не пробел, поэтому пароль с пробелом через
-// QueryEscape приезжал бы в БД с "+" вместо пробела.
-//
-// url.PathEscape тоже не подходит: он намеренно оставляет незакодированными
-// ряд sub-delims (включая "=" и "&"), что ломало разбор userinfo для паролей
-// с этими символами.
-//
-// Кодировать строго всё, кроме unreserved — заведомо безопасно: любой
-// стандартный декодер (url.Parse для userinfo, url.PathUnescape в TNS-пути)
-// корректно раскодирует %XX обратно, а "перекодирование" безвредно.
+// escapeURLComponent percent-кодирует всё кроме unreserved (RFC 3986).
+// Не url.QueryEscape (кодирует пробел как "+", а "+" в userinfo — литерал)
+// и не url.PathEscape (оставляет "=" и "&" нетронутыми).
 func escapeURLComponent(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
@@ -567,9 +384,6 @@ func escapeURLComponent(s string) string {
 	return b.String()
 }
 
-// looksLikeTNSDescriptor определяет похоже ли значение на TNS-дескриптор Oracle.
-// Признак: начинается с "(" и содержит "DESCRIPTION=" или "ADDRESS=" —
-// этого достаточно чтобы отличить TNS от обычного пароля.
 func looksLikeTNSDescriptor(val string) bool {
 	trimmed := strings.TrimSpace(val)
 	if !strings.HasPrefix(trimmed, "(") {
@@ -579,30 +393,22 @@ func looksLikeTNSDescriptor(val string) bool {
 	return strings.Contains(upper, "DESCRIPTION=") || strings.Contains(upper, "ADDRESS=")
 }
 
-// cloneQueriesForDB возвращает копию конфига где ключи запросов становятся
-// составными "name__db" для уникальности воркеров.
-// MetricName при этом сохраняется оригинальным — имя метрики в Prometheus
-// остаётся чистым без суффиксов.
+// cloneQueriesForDB даёт каждому ключу суффикс "__db" для уникальности
+// воркеров; MetricName остаётся оригинальным (метрика в Prometheus без суффикса).
 func cloneQueriesForDB(cfg Config, db string) Config {
 	if len(cfg.Queries) == 0 {
 		return cfg
 	}
 	newQueries := make(map[string]QueryConfig, len(cfg.Queries))
 	for name, q := range cfg.Queries {
-		// Ключ составной — уникален для каждой БД
-		// MetricName остаётся оригинальным именем запроса
 		newQueries[name+"__"+db] = q
 	}
 	cfg.Queries = newQueries
 	return cfg
 }
 
-// mergeConfig мержит src в dst. src (инклюд из sourceLabel) имеет приоритет —
-// перезаписывает существующие ключи. Коллизии (когда src перезаписывает
-// ключ dst с ДРУГИМ значением) записываются в dst.overwritten для логирования
-// в app.go — иначе такая коллизия проходит абсолютно молча: метрика
-// продолжает существовать под тем же именем, но начинает собирать данные
-// с другой БД или по другому SQL без единой строки в логах.
+// mergeConfig мержит src в dst; src (инклюд sourceLabel) побеждает при
+// коллизии ключей. Коллизия с ДРУГИМ значением логируется в dst.overwritten.
 func mergeConfig(dst *Config, src Config, sourceLabel string) {
 	if src.Settings.DBReconnectInterval != "" {
 		dst.Settings.DBReconnectInterval = src.Settings.DBReconnectInterval
@@ -634,13 +440,8 @@ func mergeConfig(dst *Config, src Config, sourceLabel string) {
 	}
 }
 
-// sanitizeQueries проверяет каждый запрос независимо и удаляет невалидные
-// из cfg.Queries вместо того чтобы валить весь конфиг одной ошибкой.
-// Возвращает список причин по которым запросы были удалены — для логирования.
-//
-// Критичные проверки (драйверы, URL, durations баз данных) остаются
-// в validateDatabasesAndSettings и продолжают валить весь reload — они означают
-// что конфиг структурно сломан, а не что у одного запроса опечатка.
+// sanitizeQueries проверяет каждый запрос независимо, удаляя невалидные из
+// cfg.Queries вместо того чтобы валить весь конфиг одной ошибкой.
 func sanitizeQueries(cfg *Config) []string {
 	var removed []string
 
@@ -654,8 +455,6 @@ func sanitizeQueries(cfg *Config) []string {
 	return removed
 }
 
-// validateSingleQuery проверяет один запрос и возвращает причину невалидности
-// (пустая строка — запрос валиден).
 func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
 	if strings.TrimSpace(q.SQL) == "" {
 		return "sql is required"
@@ -694,11 +493,10 @@ func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
 		}
 	}
 
+	// MetricName, не name — после cloneQueriesForDB name может быть
+	// составным worker ID ("query__db"), а не именем метрики.
 	metricName := q.MetricName
 	if metricName == "" {
-		// Не должно происходить в норме — MetricName проставляется при
-		// первой загрузке файла, до любого клонирования. Фолбэк на name
-		// на случай если это всё же где-то не так, не более того.
 		metricName = name
 	}
 	if !isValidPrometheusName(metricName) {
@@ -723,8 +521,7 @@ func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
 	return ""
 }
 
-// isValidPrometheusName проверяет валидность имени метрики по правилам Prometheus:
-// [a-zA-Z_:][a-zA-Z0-9_:]*
+// isValidPrometheusName: [a-zA-Z_:][a-zA-Z0-9_:]*
 func isValidPrometheusName(name string) bool {
 	if name == "" {
 		return false
@@ -745,8 +542,7 @@ func isValidPrometheusName(name string) bool {
 	return true
 }
 
-// isValidPrometheusLabelName проверяет валидность имени лейбла по правилам Prometheus:
-// [a-zA-Z_][a-zA-Z0-9_]*, не начинается с "__" (зарезервировано для внутреннего использования).
+// isValidPrometheusLabelName: [a-zA-Z_][a-zA-Z0-9_]*, без "__" в начале.
 func isValidPrometheusLabelName(name string) bool {
 	if name == "" || strings.HasPrefix(name, "__") {
 		return false
@@ -767,13 +563,8 @@ func isValidPrometheusLabelName(name string) bool {
 	return true
 }
 
-// validateDatabasesAndSettings проверяет критичные части конфига —
-// настройки и описания БД. Ошибки здесь валят весь reload, так как
-// означают структурно сломанный конфиг (а не опечатку в одном запросе).
-// supportedDrivers — драйверы, реально зарегистрированные импортами в
-// drivers.go. Держать этот список в синхроне с drivers.go: значение здесь
-// должно совпадать со строкой, под которой драйвер регистрируется в
-// database/sql.
+// supportedDrivers должен совпадать с тем, что реально регистрируется
+// импортами в drivers.go.
 var supportedDrivers = map[string]bool{
 	"mysql":     true,
 	"oracle":    true,
@@ -781,6 +572,9 @@ var supportedDrivers = map[string]bool{
 	"sqlserver": true,
 }
 
+// validateDatabasesAndSettings проверяет структурные части конфига.
+// Ошибки здесь валят весь reload — в отличие от sanitizeQueries, они
+// означают что конфиг сломан целиком, а не что у одного запроса опечатка.
 func validateDatabasesAndSettings(cfg Config) error {
 	if cfg.Settings.DBReconnectInterval != "" {
 		d, err := time.ParseDuration(cfg.Settings.DBReconnectInterval)
@@ -796,11 +590,8 @@ func validateDatabasesAndSettings(cfg Config) error {
 			return fmt.Errorf("settings.default_db %q is not defined in databases", cfg.Settings.DefaultDB)
 		}
 	}
-	// Валидируем сами дефолты пула ДО того как они разойдутся по всем БД
-	// (applyDefaultPoolSettings уже отработал к этому моменту) — иначе
-	// ошибка вроде settings.max_conns: -1 всплыла бы как "database X:
-	// max_conns must not be negative" в цикле ниже, для каждой БД без
-	// явного override, и не сразу было бы понятно что причина одна общая.
+	// Валидируем сами дефолты пула отдельно — иначе ошибка вроде
+	// settings.max_conns: -1 всплыла бы как ошибка каждой отдельной БД.
 	if cfg.Settings.DefaultMaxConns < 0 {
 		return fmt.Errorf("settings.max_conns must not be negative")
 	}
@@ -822,11 +613,6 @@ func validateDatabasesAndSettings(cfg Config) error {
 		if db.Driver == "" {
 			return fmt.Errorf("database %q: driver is required", name)
 		}
-		// Allowlist драйверов. Без него опечатка ("postgres" вместо "pgx")
-		// проходит валидацию конфига и превращается в бесконечный цикл
-		// неудачных reconnect-попыток в рантайме, без внятного объяснения
-		// причины. Список должен совпадать с тем, что реально
-		// зарегистрировано импортами в drivers.go.
 		if !supportedDrivers[strings.ToLower(strings.TrimSpace(db.Driver))] {
 			return fmt.Errorf("database %q: unknown driver %q (supported: mysql, oracle, pgx, sqlserver)",
 				name, db.Driver)
@@ -834,9 +620,7 @@ func validateDatabasesAndSettings(cfg Config) error {
 		if db.URL == "" {
 			return fmt.Errorf("database %q: url is required", name)
 		}
-		// Отрицательные значения в database/sql означают "без ограничений"
-		// (для MaxOpenConns) — опечатка вида max_conns: -1 незаметно снимала
-		// бы лимит вместо того чтобы его задать.
+		// database/sql трактует отрицательные значения как "без ограничений".
 		if db.MaxConns < 0 {
 			return fmt.Errorf("database %q: max_conns must not be negative", name)
 		}

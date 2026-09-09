@@ -134,11 +134,10 @@ func buildOracleDSN(rawURL string) (string, error) {
 		}
 	}
 
-	// client charset — декодировать сообщения сервера в UTF-8.
-	// Критично для Oracle с кириллической локалью (CL8MSWIN1251 и др.):
-	// без этого сообщения об ошибках приходят как \ufffd\ufffd\ufffd.
-	// Передаём через urlOptions а не через URL строку — пробел в имени параметра
-	// не позволяет надёжно закодировать его в query string.
+	// client charset — иначе сообщения об ошибках сервера с кириллицей
+	// (Oracle с локалью CL8MSWIN1251 и др.) приходят как \ufffd\ufffd\ufffd.
+	// Через urlOptions, не через URL строку — пробел в имени параметра не
+	// кодируется надёжно в query string.
 	if _, exists := urlOptions["client charset"]; !exists {
 		urlOptions["client charset"] = "UTF8"
 	}
@@ -175,15 +174,9 @@ func buildTNSDSN(rawURL, prefix string) (string, error) {
 
 	rawUser, rawPassword, _ := strings.Cut(credentials, ":")
 
-	// expandURLs в config.go percent-кодирует значения переменных перед
-	// подстановкой в URL (см. escapeURLComponent). Для обычного oracle://
-	// пути это прозрачно — url.Parse сам раскодирует userinfo. Но этот
-	// TNS-путь разбирает строку через strings.Cut, поэтому раскодировать
-	// нужно явно.
-	//
-	// PathUnescape, а НЕ QueryUnescape: последний трактует "+" как пробел
-	// (query-семантика). Пароль, содержащий литеральный "+", после
-	// QueryUnescape приезжал бы в Oracle с пробелом вместо плюса.
+	// PathUnescape, не QueryUnescape: этот путь разбирает URL через strings.Cut,
+	// раскодировать нужно вручную. QueryUnescape трактует "+" как пробел —
+	// пароль с литеральным "+" приехал бы в Oracle искажённым.
 	user, err := url.PathUnescape(rawUser)
 	if err != nil {
 		return "", fmt.Errorf("oracle+tns:// invalid encoding in username: %w", err)

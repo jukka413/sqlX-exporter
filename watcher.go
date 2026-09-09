@@ -9,49 +9,20 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// watchConfig следит за изменениями конфигурационного файла и вызывает reload при обнаружении.
+// watchConfig следит за директорией конфига (не за файлом — kubelet при
+// обновлении ConfigMap меняет ..data симлинк, а не сам файл; watch на
+// директорию переживает Remove/Rename внутри неё, watch на файл — нет).
 //
-// Поведение в Kubernetes (ConfigMap/Secret volumes):
+// reload() вызывается синхронно в этой же горутине (не в отдельной через
+// time.AfterFunc) — таймер дебаунса читается тем же select, что и
+// ctx.Done(). Это гарантирует, что reload() не может выполняться после
+// возврата из watchConfig и не переживает shutdown.
 //
-//	kubelet обновляет файлы через AtomicWriter: создаёт новую директорию,
-//	записывает файлы, атомарно переключает симлинк ..data → новая директория,
-//	удаляет старую. В результате inotify получает событие на ..data внутри
-//	отслеживаемой директории (Remove/Rename), а не IN_MODIFY/IN_CLOSE_WRITE
-//	как при обычном обновлении файла.
-//	Источник: https://ahmet.im/blog/kubernetes-inotify/
-//
-//	Важно: мы следим за ДИРЕКТОРИЕЙ, а не за отдельным файлом/симлинком.
-//	IN_DELETE_SELF/IN_MOVE_SELF (события которые ломают watch) срабатывают
-//	только когда удаляют/переименовывают САМ отслеживаемый объект — то есть
-//	директорию целиком. Удаление или переименование файла ВНУТРИ отслеживаемой
-//	директории (в том числе симлинка ..data) — это обычное дочернее событие,
-//	watch на директорию от него не ломается и переподписываться не нужно.
-//	См. inotify(7) и https://pkg.go.dev/github.com/fsnotify/fsnotify.
-//
-// Поведение вне Kubernetes (обычная ФС, vim, nano и др.):
-//
-//	Редакторы часто пишут через временный файл + rename → приходит Create.
-//	Прямая запись → приходит Write.
-//
-// Debounce и shutdown: reload() вызывается СИНХРОННО в этой же горутине
-// (не через time.AfterFunc в отдельной горутине, как было раньше) — таймер
-// дебаунса читается тем же select, что и ctx.Done()/события fsnotify. Это
-// гарантирует что: (a) reload() никогда не переживёт возврат из watchConfig —
-// вызывающий, дождавшись возврата watchConfig, точно знает что никакой
-// reload() больше не выполняется и не может внезапно стартовать; (b) если
-// reload() уже идёт (может занимать секунды — open/ping нескольких БД) в
-// момент отмены ctx, цикл select не увидит ctx.Done() пока reload() не
-// вернётся — таймер и ctx.Done() физически не могут обрабатываться
-// одновременно в этом однопоточном цикле.
-//
-// updateDirs — канал, по которому вызывающий (app.reload) присылает
-// АКТУАЛЬНЫЙ ПОЛНЫЙ список директорий для отслеживания после каждого
-// успешного парсинга конфига. Раньше этот список собирался один раз при
-// старте процесса — новый инклюд, добавленный через hot-reload в директорию,
-// которая ещё не отслеживалась, был не виден watcher'у до рестарта Pod'а.
-// Директории только добавляются, никогда не убираются — лишний watch на
-// более не нужную директорию безвреден (события из неё просто не пройдут
-// фильтр isYAMLInWatchedDir по конкретным файлам).
+// updateDirs — канал, по которому app.reload присылает актуальный полный
+// список директорий после каждого успешного парсинга (нужно чтобы новый
+// инклюд в ранее неотслеживаемой директории подхватывался без рестарта).
+// Директории только добавляются — лишний watch безвреден, события всё
+// равно фильтруются по конкретным файлам ниже.
 func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func(), updateDirs <-chan []string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -64,10 +35,8 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 		}
 	}()
 
-	// absPath вычисляется ДО того как из него берётся директория — иначе при
-	// запуске с относительным путём (--config ./config.yaml, дефолт в main.go)
-	// dir получался бы относительным ("."), а eventDir при событиях всегда
-	// абсолютный — они бы никогда не совпадали.
+	// absPath — до вычисления dir, иначе при относительном --config путь
+	// dir был бы относительным, а eventDir при событиях всегда абсолютный.
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		logger.Error("failed to resolve config path", "error", err)
@@ -139,10 +108,7 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 		case <-debounceC:
 			debounceC = nil
 			if ctx.Err() != nil {
-				// select мог одновременно увидеть готовый таймер и отменённый
-				// ctx — явная проверка на случай если выбор пал на таймер:
-				// не стартуем новый reload когда shutdown уже начался.
-				continue
+				continue // shutdown уже начался — не стартуем новый reload
 			}
 			logger.Info("config change detected, reloading")
 			reload()
@@ -158,16 +124,12 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 			}
 			eventAbs = filepath.Clean(eventAbs)
 
-			// Сравниваем только по полному абсолютному пути — сравнение по
-			// одному basename могло бы ложно совпасть с одноимённым файлом
-			// в другой отслеживаемой директории.
+			// Полный путь, не basename — иначе ложно совпало бы с
+			// одноимённым файлом в другой отслеживаемой директории.
 			isMainConfig := eventAbs == absPath
-			// ..data — специальный симлинк который kubelet переключает атомарно
-			// при обновлении ЛЮБОГО файла в ConfigMap. Реагируем всегда.
 			isDataSymlink := filepath.Base(eventAbs) == "..data"
-			// Инклюд-файлы лежат в watchedDirs под своими собственными именами
-			// (oracle-metrics.yaml и т.п.), не совпадающими с basename основного
-			// конфига — без этой проверки их изменения тихо игнорировались бы.
+			// Инклюды лежат под своими именами, не под basename основного
+			// конфига — без этого их изменения тихо игнорировались бы.
 			isYAMLInWatchedDir := func() bool {
 				ext := filepath.Ext(eventAbs)
 				if ext != ".yaml" && ext != ".yml" {
@@ -185,11 +147,7 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) ||
 				event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
-				// Никакого Remove/Add директории здесь не требуется — мы следим
-				// за директорией, а не за файлом внутри неё, а watch на директорию
-				// не ломается от Remove/Rename её содержимого (см. комментарий
-				// в начале функции).
-				triggerReload()
+				triggerReload() // watch на директорию не ломается от Remove/Rename её содержимого
 			}
 
 		case err, ok := <-watcher.Errors:
