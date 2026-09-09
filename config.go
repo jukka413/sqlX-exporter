@@ -84,6 +84,12 @@ type AppSettings struct {
 	DefaultMaxIdleConns    int    `yaml:"max_idle_conns,omitempty"`
 	DefaultMaxConnLifetime string `yaml:"max_conn_lifetime,omitempty"`
 	DefaultMaxConnIdleTime string `yaml:"max_conn_idle_time,omitempty"`
+
+	// DefaultTimezone — таймзона по умолчанию для запросов с schedule:,
+	// у которых нет своего schedule.timezone. Применяется в
+	// applyDefaultTimezone. Если не задано ни здесь, ни в самом запросе —
+	// используется UTC (см. parseSchedule).
+	DefaultTimezone string `yaml:"default_timezone,omitempty"`
 }
 
 func (s AppSettings) DBReconnectIntervalDuration() time.Duration {
@@ -170,6 +176,7 @@ func loadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 	applyDefaultPoolSettings(&cfg)
+	applyDefaultTimezone(&cfg)
 	return cfg, nil
 }
 
@@ -192,6 +199,22 @@ func applyDefaultPoolSettings(cfg *Config) {
 			db.MaxConnIdleTime = s.DefaultMaxConnIdleTime
 		}
 		cfg.Databases[name] = db
+	}
+}
+
+// applyDefaultTimezone проставляет settings.default_timezone в schedule
+// каждого запроса, у которого нет своего schedule.timezone. Явное значение
+// в самом запросе всегда побеждает. Если не задано нигде — parseSchedule
+// возьмёт UTC.
+func applyDefaultTimezone(cfg *Config) {
+	if cfg.Settings.DefaultTimezone == "" {
+		return
+	}
+	for name, q := range cfg.Queries {
+		if q.Schedule != nil && q.Schedule.Timezone == "" {
+			q.Schedule.Timezone = cfg.Settings.DefaultTimezone
+			cfg.Queries[name] = q
+		}
 	}
 }
 
@@ -597,6 +620,11 @@ func validateDatabasesAndSettings(cfg Config) error {
 	if cfg.Settings.DefaultDB != "" {
 		if _, ok := cfg.Databases[cfg.Settings.DefaultDB]; !ok {
 			return fmt.Errorf("settings.default_db %q is not defined in databases", cfg.Settings.DefaultDB)
+		}
+	}
+	if cfg.Settings.DefaultTimezone != "" {
+		if _, err := time.LoadLocation(cfg.Settings.DefaultTimezone); err != nil {
+			return fmt.Errorf("settings.default_timezone is invalid: %w", err)
 		}
 	}
 	// Валидируем сами дефолты пула отдельно — иначе ошибка вроде
