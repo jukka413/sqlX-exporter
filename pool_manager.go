@@ -184,6 +184,16 @@ func (pm *poolManager) updateDBUpMetrics() {
 		dbUp.WithLabelValues(name).Set(1)
 	}
 	for name := range failed {
+		// БД может быть одновременно и в pools (старое соединение всё ещё
+		// работает), и в failed (новый кандидат конфига не подключился) —
+		// это намеренное graceful degradation в applyConfig. app_db_up
+		// должен отражать "есть ли СЕЙЧАС рабочее соединение", а не
+		// "применился ли последний кандидат конфига" — иначе метрика
+		// показывала бы 0 в момент, когда экспортёр реально продолжает
+		// успешно собирать данные через старый pool.
+		if _, hasWorkingPool := pools[name]; hasWorkingPool {
+			continue
+		}
 		dbUp.WithLabelValues(name).Set(0)
 	}
 }

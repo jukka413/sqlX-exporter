@@ -464,6 +464,21 @@ func mergeConfig(dst *Config, src Config, sourceLabel string) {
 	if src.Settings.DefaultDB != "" {
 		dst.Settings.DefaultDB = src.Settings.DefaultDB
 	}
+	if src.Settings.DefaultTimezone != "" {
+		dst.Settings.DefaultTimezone = src.Settings.DefaultTimezone
+	}
+	if src.Settings.DefaultMaxConns != 0 {
+		dst.Settings.DefaultMaxConns = src.Settings.DefaultMaxConns
+	}
+	if src.Settings.DefaultMaxIdleConns != 0 {
+		dst.Settings.DefaultMaxIdleConns = src.Settings.DefaultMaxIdleConns
+	}
+	if src.Settings.DefaultMaxConnLifetime != "" {
+		dst.Settings.DefaultMaxConnLifetime = src.Settings.DefaultMaxConnLifetime
+	}
+	if src.Settings.DefaultMaxConnIdleTime != "" {
+		dst.Settings.DefaultMaxConnIdleTime = src.Settings.DefaultMaxConnIdleTime
+	}
 
 	if dst.Databases == nil {
 		dst.Databases = make(map[string]DBConfig)
