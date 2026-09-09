@@ -16,11 +16,21 @@ type dbPool struct {
 }
 
 // poolManager — единственный владелец подключений к БД; только он вызывает
-// sql.DB.Close(). pools, failedPools и generation всегда мутируются вместе
+// sql.DB.Close(). pools, failedPools и revision всегда мутируются вместе
 // под одним локом (applyConfig, commitReconnect) — это гарантирует, что
-// reconnect-попытка, снявшая (generation, failedPools) единым снэпшотом,
+// reconnect-попытка, снявшая (revision, failedPools) единым снэпшотом,
 // не может увидеть их в рассинхронизированном состоянии при повторной
 // проверке перед коммитом.
+//
+// revision не генерируется здесь — его присваивает app.reload() (см. поле
+// app.revision), тем же значением, что и workerManager в этом же вызове.
+// Так poolManager и workerManager всегда штампуются ОДНИМ числом за один
+// reload — раньше у каждого было своё независимое понятие "актуальности"
+// (generation у пула, lastQueries без версии у воркеров), и health-checker
+// мог снять их снэпшоты в момент когда reload обновил одно, но ещё не
+// другое — рассинхронизированная пара проходила бы проверку "не устарело"
+// каждая сама по себе, хотя вместе они уже не описывали согласованное
+// состояние.
 type poolManager struct {
 	ctx    context.Context
 	logger *slog.Logger
@@ -34,7 +44,7 @@ type poolManager struct {
 	mu          sync.Mutex
 	pools       map[string]*dbPool
 	failedPools map[string]DBConfig
-	generation  uint64
+	revision    uint64
 }
 
 func newPoolManager(ctx context.Context, logger *slog.Logger) *poolManager {
@@ -56,7 +66,7 @@ func (pm *poolManager) snapshotPools() map[string]*dbPool {
 	return out
 }
 
-// snapshotForReconnect возвращает generation и failedPools как согласованную
+// snapshotForReconnect возвращает revision и failedPools как согласованную
 // пару — см. комментарий у типа.
 func (pm *poolManager) snapshotForReconnect() (uint64, map[string]DBConfig) {
 	pm.mu.Lock()
@@ -65,7 +75,7 @@ func (pm *poolManager) snapshotForReconnect() (uint64, map[string]DBConfig) {
 	for k, v := range pm.failedPools {
 		failed[k] = v
 	}
-	return pm.generation, failed
+	return pm.revision, failed
 }
 
 // dial открывает и пингует соединение. Не трогает состояние poolManager —
@@ -89,12 +99,14 @@ func (pm *poolManager) dial(name string, dbCfg DBConfig) (*sql.DB, bool) {
 	return db, true
 }
 
-// applyConfig реконсилирует пулы с новым набором конфигов БД.
+// applyConfig реконсилирует пулы с новым набором конфигов БД, штампуя
+// результат переданным revision (см. комментарий у типа — тем же значением
+// в этом же reload штампуется workerManager).
 //
 // toClose — пулы к закрытию; вызывающий обязан сначала остановить воркеры,
 // использующие эти пулы, и только потом закрыть их (см. app.reload).
 // removedDBs — БД, пропавшие из конфига целиком.
-func (pm *poolManager) applyConfig(dbs map[string]DBConfig) (toClose map[string]*dbPool, removedDBs []string) {
+func (pm *poolManager) applyConfig(revision uint64, dbs map[string]DBConfig) (toClose map[string]*dbPool, removedDBs []string) {
 	pm.transitionMu.Lock()
 	defer pm.transitionMu.Unlock()
 
@@ -157,7 +169,7 @@ func (pm *poolManager) applyConfig(dbs map[string]DBConfig) (toClose map[string]
 	// состояния каждый раз, поэтому мержить с прошлым failedPools не нужно.
 	pm.pools = newPools
 	pm.failedPools = newFailed
-	pm.generation++
+	pm.revision = revision
 	pm.mu.Unlock()
 
 	pm.updateDBUpMetrics()
@@ -179,14 +191,14 @@ func (pm *poolManager) updateDBUpMetrics() {
 
 // commitReconnect проверяет попытку дозвона против текущего состояния перед
 // применением. ok=false — попытка устарела, вызывающий сам закрывает db.
-func (pm *poolManager) commitReconnect(name string, dbCfg DBConfig, expectedGen uint64, db *sql.DB) (oldPool *dbPool, ok bool) {
+func (pm *poolManager) commitReconnect(name string, dbCfg DBConfig, expectedRevision uint64, db *sql.DB) (oldPool *dbPool, ok bool) {
 	pm.transitionMu.Lock()
 	defer pm.transitionMu.Unlock()
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	if pm.generation != expectedGen {
+	if pm.revision != expectedRevision {
 		return nil, false
 	}
 	current, stillFailed := pm.failedPools[name]

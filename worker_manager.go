@@ -27,10 +27,15 @@ type workerManager struct {
 	reconcileMu sync.Mutex
 	workers     map[string]*worker
 
-	// lastQueries — снэпшот последнего применённого состояния запросов.
-	// Нужен poolHealthChecker'у чтобы после реконнекта БД запустить
-	// воркеры без повторного чтения файла конфига.
-	lastQueries map[string]QueryConfig
+	// lastQueries — снэпшот последнего применённого состояния запросов, с
+	// revision (см. app.revision и комментарий у poolManager), которым он
+	// был проштампован. poolHealthChecker сверяет эту revision с той, что
+	// у poolManager, прежде чем реконсилировать воркеры после реконнекта —
+	// если они разошлись, значит health-checker застал reload() между тем,
+	// как обновился пул, и тем, как обновились воркеры, и снэпшот здесь
+	// ещё не отражает актуальное состояние.
+	lastQueries         map[string]QueryConfig
+	lastQueriesRevision uint64
 }
 
 func newWorkerManager(ctx context.Context, logger *slog.Logger) *workerManager {
@@ -42,19 +47,22 @@ func newWorkerManager(ctx context.Context, logger *slog.Logger) *workerManager {
 	}
 }
 
-func (wm *workerManager) snapshotLastQueries() map[string]QueryConfig {
+// snapshotLastQueries возвращает последнее применённое состояние запросов
+// вместе с revision, которым оно проштамповано.
+func (wm *workerManager) snapshotLastQueries() (map[string]QueryConfig, uint64) {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
 	out := make(map[string]QueryConfig, len(wm.lastQueries))
 	for k, v := range wm.lastQueries {
 		out[k] = v
 	}
-	return out
+	return out, wm.lastQueriesRevision
 }
 
 // reconcile приводит воркеры в соответствие с queries, используя снэпшот
-// доступных пулов и резолвленное имя БД по умолчанию.
-func (wm *workerManager) reconcile(queries map[string]QueryConfig, pools map[string]*dbPool, defaultDB string) {
+// доступных пулов и резолвленное имя БД по умолчанию. revision — то же
+// число, которым в этом же reload проштампован poolManager (см. app.revision).
+func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConfig, pools map[string]*dbPool, defaultDB string) {
 	// Сериализует reconcile сам с собой — reload() и poolHealthChecker()
 	// вызывают его из разных горутин.
 	wm.reconcileMu.Lock()
@@ -69,6 +77,7 @@ func (wm *workerManager) reconcile(queries map[string]QueryConfig, pools map[str
 	for k, v := range queries {
 		wm.lastQueries[k] = v
 	}
+	wm.lastQueriesRevision = revision
 	wm.mu.Unlock()
 
 	for name, q := range queries {
