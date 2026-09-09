@@ -265,6 +265,16 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 				return cfg, fmt.Errorf("include %q resolves outside the config root directory %q", includePath, rootDir)
 			}
 
+			// Регистрируем как dependency ДО попытки загрузки, а не после —
+			// если файл сейчас отсутствует или содержит невалидный YAML,
+			// loadConfigWithContext ниже вернёт ошибку и никогда не дойдёт
+			// до своего собственного самостоятельного добавления в
+			// dependencies. Без этой строки watcher не знал бы, что нужно
+			// следить за директорией сломанного инклюда — и когда его позже
+			// починят, reload не сработал бы сам по себе, только по
+			// какой-то другой, не связанной причине.
+			cfg.dependencies = append(cfg.dependencies, absFullPath)
+
 			// Сначала полный путь, потом basename — иначе team-a/x.yaml и
 			// team-b/x.yaml делили бы одну запись в include_defaults.
 			baseName := filepath.Base(includePath)
