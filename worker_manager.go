@@ -186,6 +186,11 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 			w.wg.Wait()
 			if identityChanged && w.cfg.MetricName != "" {
 				deleteWorkerRows(w.cfg, w.prevLabels)
+				// (metricName, db) уже уникален для конкретного воркера даже
+				// при клонировании на несколько БД (см. тот же аргумент в
+				// stopWorker) — старая комбинация становится мёртвой, новый
+				// воркер пишет уже под (metricName, новый db).
+				deleteQueryHealthMetrics(w.cfg.MetricName, w.cfg.DB)
 			}
 			stats.Restarted++
 		} else {

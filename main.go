@@ -71,10 +71,15 @@ func main() {
 	}()
 
 	go a.pm.metricsUpdater(5 * time.Second)
-	go a.poolHealthChecker()
 
-	// Первый reload уже публикует директории для watcher через a.watchDirsCh.
+	// Первый reload уже публикует директории для watcher через a.watchDirsCh
+	// и выставляет a.reconnectInterval из реального конфига. poolHealthChecker
+	// стартует ПОСЛЕ этого, не до — иначе его тикер создавался бы с
+	// захардкоженным дефолтом 5 минут из newApp(), и настоящее значение
+	// db_reconnect_interval применилось бы только на первом естественном
+	// тике старого тикера, каким бы коротким ни был интервал в конфиге.
 	a.reload()
+	go a.poolHealthChecker()
 
 	// watcherWG дожидается полного возврата watchConfig перед teardown —
 	// иначе shutdown мог начаться пока watcher ещё выполняет reload().
