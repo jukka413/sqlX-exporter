@@ -175,9 +175,25 @@ func loadConfig(path string) (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
+	normalizeDrivers(&cfg)
 	applyDefaultPoolSettings(&cfg)
 	applyDefaultTimezone(&cfg)
 	return cfg, nil
+}
+
+// normalizeDrivers приводит driver каждой БД к нижнему регистру и обрезает
+// пробелы. Без этого валидация (сравнивающая через ToLower) и рантайм
+// расходились бы: sql.Open требует ТОЧНОГО совпадения регистра с тем именем,
+// под которым драйвер зарегистрировал себя (см. drivers.go) — "driver: PGX"
+// проходил бы validateDatabasesAndSettings, но падал в sql.Open("PGX", ...)
+// с "unknown driver". Нормализация здесь, один раз, в единственной точке
+// где конфиг финализируется — дальше по всему коду (валидация, pool_manager,
+// db.go) driver уже гарантированно в каноническом виде.
+func normalizeDrivers(cfg *Config) {
+	for name, db := range cfg.Databases {
+		db.Driver = strings.ToLower(strings.TrimSpace(db.Driver))
+		cfg.Databases[name] = db
+	}
 }
 
 // applyDefaultPoolSettings проставляет дефолты пула из settings: в БД без

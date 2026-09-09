@@ -73,13 +73,25 @@ type ReconcileStats struct {
 // число, которым в этом же reload проштампован poolManager (см. app.revision).
 func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConfig, pools map[string]*dbPool, defaultDB string) ReconcileStats {
 	// Сериализует reconcile сам с собой — reload() и poolHealthChecker()
-	// вызывают его из разных горутин.
+	// вызывают его из разных горутин. Сериализация означает только "не
+	// одновременно", а не "в порядке revision" — reconcile(R-1) вполне может
+	// физически выполниться ПОСЛЕ reconcile(R), если health-checker снял
+	// свой снэпшот раньше, а до вызова реально дошёл позже. Без проверки
+	// ниже такой запоздавший reconcile тихо откатил бы уже применённое
+	// состояние на предыдущую версию.
 	wm.reconcileMu.Lock()
 	defer wm.reconcileMu.Unlock()
 
 	var stats ReconcileStats
 
 	wm.mu.Lock()
+	if revision < wm.lastQueriesRevision {
+		current := wm.lastQueriesRevision
+		wm.mu.Unlock()
+		wm.logger.Warn("skipping stale worker reconcile — a newer revision was already applied",
+			"revision", revision, "current_revision", current)
+		return stats
+	}
 	currentWorkers := make(map[string]*worker, len(wm.workers))
 	for k, v := range wm.workers {
 		currentWorkers[k] = v
