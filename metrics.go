@@ -86,6 +86,20 @@ var (
 		[]string{"db"},
 	)
 
+	// queryHealthSchemaConflict — 1 пока у запроса конфликт схемы лейблов
+	// (labels/value_column изменились в конфиге, но Prometheus не позволяет
+	// применить это без рестарта — см. комментарий в workerManager.reconcile).
+	// Отсутствие серии = нет конфликта; появление и удаление серии, а не
+	// просто её значение, потому что цель — не пропустить это в логах,
+	// которые часто не читают построчно, а увидеть прямо на дашборде.
+	queryHealthSchemaConflict = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "app_query_schema_conflict",
+			Help: "1 if the running query's label schema conflicts with its current config and cannot be applied without a process restart",
+		},
+		[]string{"query"},
+	)
+
 	queryDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "app_query_duration_seconds",
@@ -131,6 +145,7 @@ func init() {
 		configLastReloadTimestamp,
 		configLastSuccessTimestamp,
 		dbUp,
+		queryHealthSchemaConflict,
 		queryDuration,
 		dbPoolAcquired,
 		dbPoolIdle,

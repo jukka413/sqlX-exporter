@@ -112,6 +112,42 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 			q.DB = defaultDB
 		}
 
+		w, exists := currentWorkers[name]
+
+		// Смена набора имён лейблов/value_column меняет схему GaugeVec.
+		// Prometheus не допускает regenerate схемы под тем же именем даже
+		// после Unregister (Registry хранит dimHashesByName на весь срок
+		// жизни процесса) — поэтому вместо гибрида (новый SQL + старая
+		// схема, который тут же упал бы с "value_column not found", если
+		// новая колонка отличается от старой) замораживаем ВЕСЬ QueryConfig
+		// целиком на последнем рабочем состоянии — не только Labels/
+		// ValueColumn, но и SQL/DB/timeout/interval. Проверка идёт ДО
+		// резолва пула ниже: замороженный q.DB может отличаться от того q.DB,
+		// что было в новом конфиге, и пул нужно резолвить именно под старую,
+		// замороженную БД. Изменения пула (см. poolChanged ниже) при этом
+		// всё ещё применяются штатно — просто со старым SQL, а не с новым.
+		schemaChanged := exists &&
+			(w.cfg.ValueColumn != q.ValueColumn || !sameLabelKeys(w.cfg.Labels, q.Labels))
+		if schemaChanged {
+			wm.logger.Error(
+				"labels or value_column changed for a running query — Prometheus does not support "+
+					"changing a metric's label schema without a process restart; the entire query "+
+					"config (sql/db/timeout/interval included, not just the schema fields) is frozen "+
+					"at its last working state until restart",
+				"query", name, "db", q.DB)
+			if w.cfg.MetricName != "" {
+				queryHealthSchemaConflict.WithLabelValues(w.cfg.MetricName).Set(1)
+			}
+			q = w.cfg
+		} else if exists && w.cfg.MetricName != "" {
+			// Конфликта в этом раунде нет — если он был раньше (labels/
+			// value_column откатили обратно к рабочим, или это уже другой
+			// запрос под тем же именем), снимаем сигнал. Дешёвый no-op если
+			// сигнала и не было — DeleteLabelValues на несуществующей серии
+			// просто ничего не делает.
+			queryHealthSchemaConflict.DeleteLabelValues(w.cfg.MetricName)
+		}
+
 		pEntry, ok := pools[q.DB]
 		if !ok || pEntry == nil || pEntry.db == nil {
 			wm.logger.Error("db not available for query", "query", name, "db", q.DB)
@@ -128,29 +164,9 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 		}
 		q.DBEnv = pEntry.cfg.Env
 
-		w, exists := currentWorkers[name]
-
 		// Пул этой БД пересоздан (например сменился url) — старая ссылка
 		// на *sql.DB уже недействительна, даже если сам query не менялся.
 		poolChanged := exists && w.pool != pEntry
-
-		// Смена набора имён лейблов/value_column меняет схему GaugeVec.
-		// Prometheus не допускает regenerate схемы под тем же именем даже
-		// после Unregister (Registry хранит dimHashesByName на весь срок
-		// жизни процесса) — поэтому эти два поля откатываем к уже
-		// зарегистрированным, а остальные изменения (SQL, DB, pool и т.д.)
-		// применяем как обычно.
-		schemaChanged := exists &&
-			(w.cfg.ValueColumn != q.ValueColumn || !sameLabelKeys(w.cfg.Labels, q.Labels))
-		if schemaChanged {
-			wm.logger.Error(
-				"labels or value_column changed for a running query — Prometheus does not support "+
-					"changing a metric's label schema without a process restart; applying every other "+
-					"change (sql/db/timeout/interval) but keeping the previous label schema until restart",
-				"query", name, "db", q.DB)
-			q.Labels = w.cfg.Labels
-			q.ValueColumn = w.cfg.ValueColumn
-		}
 
 		// DB/env/значение лейбла изменились (набор имён — тот же, иначе
 		// поймали бы это выше) — данные переезжают на другую time series,
@@ -252,6 +268,11 @@ func (wm *workerManager) stopWorker(name string) bool {
 	if metricName != "" {
 		if !sharedByOthers {
 			unregisterQueryMetric(metricName)
+			// Только если метрику никто больше не использует — иначе другой
+			// клон (cloneQueriesForDB на несколько БД) может всё ещё быть
+			// в конфликте, и мы бы стёрли его сигнал только потому что
+			// ЭТОТ конкретный клон убрали из конфига.
+			queryHealthSchemaConflict.DeleteLabelValues(metricName)
 		} else {
 			deleteWorkerRows(stoppedCfg, stoppedPrevLabels)
 		}
