@@ -61,7 +61,7 @@ var (
 			Name: "app_config_reload_total",
 			Help: "Total number of config reload attempts by result",
 		},
-		// result: "success" | "load_error" | "invalid_config"
+		// result: "success" | "partial_success" | "load_error" | "invalid_config"
 		[]string{"result"},
 	)
 

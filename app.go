@@ -162,7 +162,9 @@ func (a *app) poolHealthChecker() {
 						"reconciling with the best available snapshot, a concurrent reload will correct this shortly",
 						"db", name, "pool_revision", rev, "worker_revision", queriesRev)
 				}
-				a.wm.reconcile(queriesRev, queries, a.pm.snapshotPools(), a.getDefaultDB())
+				stats := a.wm.reconcile(queriesRev, queries, a.pm.snapshotPools(), a.getDefaultDB())
+				a.logger.Info("workers reconciled after reconnect", "db", name,
+					"queries_started", stats.Started, "queries_restarted", stats.Restarted)
 
 				// После reconcile — он гарантированно останавливает воркеры,
 				// использующие старый пул, прежде чем этот пул закрывается.
@@ -232,15 +234,30 @@ func (a *app) reload() {
 
 	// reconcile ДО закрытия старых пулов — иначе воркер может тикнуть в
 	// окне между Close() и остановкой воркера и получить "database is closed".
-	a.wm.reconcile(rev, newCfg.Queries, a.pm.snapshotPools(), a.getDefaultDB())
+	stats := a.wm.reconcile(rev, newCfg.Queries, a.pm.snapshotPools(), a.getDefaultDB())
 
 	a.pm.closePools(toClose)
 	a.pm.deletePoolMetrics(removedDBs)
 
-	configReloadTotal.WithLabelValues("success").Inc()
+	// success только если реально ВСЁ применилось; наличие failedIncludes
+	// означает что часть конфига (запросы/БД одного или нескольких файлов)
+	// не была применена — раньше это всё равно писалось как "success",
+	// хотя app_config_include_failures уже мог быть > 0.
+	result := "success"
+	if len(newCfg.failedIncludes) > 0 {
+		result = "partial_success"
+	}
+	configReloadTotal.WithLabelValues(result).Inc()
 	configLastSuccessTimestamp.SetToCurrentTime()
 
-	a.logger.Info("reload complete")
+	a.logger.Info("reload complete",
+		"result", result,
+		"failed_includes", len(newCfg.failedIncludes),
+		"queries_started", stats.Started,
+		"queries_restarted", stats.Restarted,
+		"queries_stopped", stats.Stopped,
+		"queries_unchanged", stats.Unchanged,
+	)
 }
 
 func (a *app) stopAllWorkers() {

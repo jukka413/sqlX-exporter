@@ -59,14 +59,25 @@ func (wm *workerManager) snapshotLastQueries() (map[string]QueryConfig, uint64) 
 	return out, wm.lastQueriesRevision
 }
 
+// ReconcileStats — что именно сделал reconcile, для содержательного лога
+// после reload вместо голого "reload complete".
+type ReconcileStats struct {
+	Started   int // новых воркеров создано
+	Restarted int // существующих воркеров пересоздано (что-то изменилось)
+	Stopped   int // воркеров остановлено (убраны из конфига или БД недоступна)
+	Unchanged int // запросов, для которых воркер не тронут
+}
+
 // reconcile приводит воркеры в соответствие с queries, используя снэпшот
 // доступных пулов и резолвленное имя БД по умолчанию. revision — то же
 // число, которым в этом же reload проштампован poolManager (см. app.revision).
-func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConfig, pools map[string]*dbPool, defaultDB string) {
+func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConfig, pools map[string]*dbPool, defaultDB string) ReconcileStats {
 	// Сериализует reconcile сам с собой — reload() и poolHealthChecker()
 	// вызывают его из разных горутин.
 	wm.reconcileMu.Lock()
 	defer wm.reconcileMu.Unlock()
+
+	var stats ReconcileStats
 
 	wm.mu.Lock()
 	currentWorkers := make(map[string]*worker, len(wm.workers))
@@ -98,7 +109,9 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 			// пуле нельзя: та БД могла быть убрана из конфига этим же reload
 			// и её пул через пару строк закроет pm.applyConfig, а воркер
 			// продолжил бы получать "sql: database is closed".
-			wm.stopWorker(name)
+			if wm.stopWorker(name) {
+				stats.Stopped++
+			}
 			continue
 		}
 		q.DBEnv = pEntry.cfg.Env
@@ -135,6 +148,7 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 
 		changed := !exists || !sameQueryConfig(w.cfg, q) || poolChanged || identityChanged
 		if !changed {
+			stats.Unchanged++
 			continue
 		}
 
@@ -145,6 +159,9 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 			if identityChanged && w.cfg.MetricName != "" {
 				deleteWorkerRows(w.cfg, w.prevLabels)
 			}
+			stats.Restarted++
+		} else {
+			stats.Started++
 		}
 
 		var prevLabels *[]prometheus.Labels
@@ -178,24 +195,29 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 
 	for _, name := range toRemove {
 		wm.logger.Info("stopping removed query", "query", name)
-		wm.stopWorker(name)
+		if wm.stopWorker(name) {
+			stats.Stopped++
+		}
 	}
+
+	return stats
 }
 
 // stopWorker останавливает и убирает воркер name из wm.workers, снимая
 // метрику целиком (если её больше никто не использует) или только его
 // собственные строки (если использует — cloneQueriesForDB на несколько БД).
+// Возвращает false, если такого воркера уже не было (нечего было останавливать).
 //
 // Общий путь для двух случаев: запрос исчез из конфига целиком, и запрос
 // остался, но резолвится в БД, к которой сейчас нет пула (см. reconcile —
 // без этого вызова там воркер остался бы работать на СТАРОЙ, уже не
 // актуальной БД, и рисковал держать ссылку на пул, который вот-вот закроют).
-func (wm *workerManager) stopWorker(name string) {
+func (wm *workerManager) stopWorker(name string) bool {
 	wm.mu.Lock()
 	w, exists := wm.workers[name]
 	if !exists {
 		wm.mu.Unlock()
-		return
+		return false
 	}
 	w.cancel()
 	wg := w.wg
@@ -222,6 +244,7 @@ func (wm *workerManager) stopWorker(name string) {
 			deleteWorkerRows(stoppedCfg, stoppedPrevLabels)
 		}
 	}
+	return true
 }
 
 func (wm *workerManager) stopAll() {
