@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -25,13 +26,21 @@ func validateSchedule(s *ScheduleConfig) error {
 		return errors.New("schedule.at is empty")
 	}
 	for _, a := range s.At {
-		// Валидируем каждый элемент через splitComma — поддерживаем "mon,wed" и "03:00,14:39"
-		for _, wd := range splitComma(a.Weekday) {
+		weekdays := splitComma(a.Weekday)
+		if len(weekdays) == 0 {
+			return fmt.Errorf("schedule.at: weekday %q has no valid entries", a.Weekday)
+		}
+		for _, wd := range weekdays {
 			if _, err := parseWeekday(wd); err != nil {
 				return err
 			}
 		}
-		for _, t := range splitComma(a.Time) {
+
+		times := splitComma(a.Time)
+		if len(times) == 0 {
+			return fmt.Errorf("schedule.at: time %q has no valid entries", a.Time)
+		}
+		for _, t := range times {
 			if _, _, err := parseHHMM(t); err != nil {
 				return err
 			}
@@ -103,7 +112,11 @@ func sameSchedule(a, b *ScheduleConfig) bool {
 }
 
 func parseSchedule(cfg *ScheduleConfig) (*time.Location, []scheduleEntry, error) {
-	loc := time.Local
+	// UTC, не time.Local — иначе время срабатывания schedule: зависело бы
+	// от TZ окружения контейнера/базового образа, а не только от текста
+	// конфига. Одинаковый конфиг в разных подах мог бы сработать в разное
+	// время просто из-за разницы в сборке образа.
+	loc := time.UTC
 	var err error
 	if cfg.Timezone != "" {
 		loc, err = time.LoadLocation(cfg.Timezone)
