@@ -80,8 +80,14 @@ type AppSettings struct {
 	// Дефолты пула для databases: — применяются в applyDefaultPoolSettings,
 	// когда БД не задаёт поле явно. Имена ключей совпадают с полями
 	// DBConfig намеренно, для интуитивного переопределения.
-	DefaultMaxConns        int    `yaml:"max_conns,omitempty"`
-	DefaultMaxIdleConns    int    `yaml:"max_idle_conns,omitempty"`
+	//
+	// *int, не int — иначе нельзя было бы отличить "явно 0" от "не задано":
+	// у Go нулевое значение int — тоже 0, и database/sql трактует
+	// max_idle_conns=0 как значащее ("не держать простаивающие соединения",
+	// а не дефолтные 2) — явный ноль на уровне конкретной БД должен уметь
+	// переопределить ненулевой глобальный дефолт, а не потеряться в нём.
+	DefaultMaxConns        *int   `yaml:"max_conns,omitempty"`
+	DefaultMaxIdleConns    *int   `yaml:"max_idle_conns,omitempty"`
 	DefaultMaxConnLifetime string `yaml:"max_conn_lifetime,omitempty"`
 	DefaultMaxConnIdleTime string `yaml:"max_conn_idle_time,omitempty"`
 
@@ -111,8 +117,9 @@ type DBConfig struct {
 	// метриках этой БД.
 	Env string `yaml:"env,omitempty"`
 
-	MaxConns     int `yaml:"max_conns"`
-	MaxIdleConns int `yaml:"max_idle_conns"`
+	// *int, не int — см. комментарий у AppSettings.DefaultMaxConns.
+	MaxConns     *int `yaml:"max_conns"`
+	MaxIdleConns *int `yaml:"max_idle_conns"`
 
 	MaxConnLifetime string `yaml:"max_conn_lifetime,omitempty"`
 	MaxConnIdleTime string `yaml:"max_conn_idle_time,omitempty"`
@@ -200,10 +207,10 @@ func normalizeDrivers(cfg *Config) {
 func applyDefaultPoolSettings(cfg *Config) {
 	s := cfg.Settings
 	for name, db := range cfg.Databases {
-		if db.MaxConns == 0 {
+		if db.MaxConns == nil {
 			db.MaxConns = s.DefaultMaxConns
 		}
-		if db.MaxIdleConns == 0 {
+		if db.MaxIdleConns == nil {
 			db.MaxIdleConns = s.DefaultMaxIdleConns
 		}
 		if db.MaxConnLifetime == "" {
@@ -483,10 +490,10 @@ func mergeConfig(dst *Config, src Config, sourceLabel string) {
 	if src.Settings.DefaultTimezone != "" {
 		dst.Settings.DefaultTimezone = src.Settings.DefaultTimezone
 	}
-	if src.Settings.DefaultMaxConns != 0 {
+	if src.Settings.DefaultMaxConns != nil {
 		dst.Settings.DefaultMaxConns = src.Settings.DefaultMaxConns
 	}
-	if src.Settings.DefaultMaxIdleConns != 0 {
+	if src.Settings.DefaultMaxIdleConns != nil {
 		dst.Settings.DefaultMaxIdleConns = src.Settings.DefaultMaxIdleConns
 	}
 	if src.Settings.DefaultMaxConnLifetime != "" {
@@ -676,10 +683,10 @@ func validateDatabasesAndSettings(cfg Config) error {
 	}
 	// Валидируем сами дефолты пула отдельно — иначе ошибка вроде
 	// settings.max_conns: -1 всплыла бы как ошибка каждой отдельной БД.
-	if cfg.Settings.DefaultMaxConns < 0 {
+	if cfg.Settings.DefaultMaxConns != nil && *cfg.Settings.DefaultMaxConns < 0 {
 		return fmt.Errorf("settings.max_conns must not be negative")
 	}
-	if cfg.Settings.DefaultMaxIdleConns < 0 {
+	if cfg.Settings.DefaultMaxIdleConns != nil && *cfg.Settings.DefaultMaxIdleConns < 0 {
 		return fmt.Errorf("settings.max_idle_conns must not be negative")
 	}
 	if cfg.Settings.DefaultMaxConnLifetime != "" {
@@ -705,15 +712,16 @@ func validateDatabasesAndSettings(cfg Config) error {
 			return fmt.Errorf("database %q: url is required", name)
 		}
 		// database/sql трактует отрицательные значения как "без ограничений".
-		if db.MaxConns < 0 {
+		if db.MaxConns != nil && *db.MaxConns < 0 {
 			return fmt.Errorf("database %q: max_conns must not be negative", name)
 		}
-		if db.MaxIdleConns < 0 {
+		if db.MaxIdleConns != nil && *db.MaxIdleConns < 0 {
 			return fmt.Errorf("database %q: max_idle_conns must not be negative", name)
 		}
-		if db.MaxIdleConns > 0 && db.MaxConns > 0 && db.MaxIdleConns > db.MaxConns {
+		if db.MaxIdleConns != nil && db.MaxConns != nil &&
+			*db.MaxIdleConns > 0 && *db.MaxConns > 0 && *db.MaxIdleConns > *db.MaxConns {
 			return fmt.Errorf("database %q: max_idle_conns (%d) must be <= max_conns (%d)",
-				name, db.MaxIdleConns, db.MaxConns)
+				name, *db.MaxIdleConns, *db.MaxConns)
 		}
 		if db.MaxConnLifetime != "" {
 			d, err := time.ParseDuration(db.MaxConnLifetime)

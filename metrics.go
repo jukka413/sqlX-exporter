@@ -15,7 +15,9 @@ var (
 			Name: "app_query_errors_total",
 			Help: "Total number of query execution errors",
 		},
-		// reason: "timeout" | "db_error" | "cancelled"
+		// reason: "timeout" | "db_error" | "schema_mismatch" — cancelled
+		// сюда не попадает, это только исход в логе (см. runOnce), Inc()
+		// для него никогда не вызывается.
 		[]string{"query", "db", "reason"},
 	)
 
@@ -330,9 +332,12 @@ func deleteQueryHealthMetrics(metricName, db string) {
 	queryUp.DeleteLabelValues(metricName, db)
 	queryLastSuccess.DeleteLabelValues(metricName, db)
 	queryDuration.DeleteLabelValues(metricName, db)
-	// reason заранее неизвестен — какие из трёх встречались для этого
-	// воркера мы не отслеживаем, поэтому удаляем все возможные комбинации.
-	for _, reason := range []string{"timeout", "db_error", "cancelled"} {
+	// cancelled не входит в список — runOnce возвращается до Inc() именно
+	// для этого reason, значения counter'а с ним никогда не бывает, чистить
+	// нечего. schema_mismatch — реальный, накапливающийся reason, отсутствие
+	// его здесь раньше оставляло {query,db,reason="schema_mismatch"}
+	// навсегда после удаления запроса.
+	for _, reason := range []string{"timeout", "db_error", "schema_mismatch"} {
 		queryErrors.DeleteLabelValues(metricName, db, reason)
 	}
 }

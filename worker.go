@@ -37,16 +37,6 @@ func startQueryWorker(
 		return
 	}
 
-	runner := newSingleRunner(ctx, logger, name, prevLabels)
-	// Отменяем И ждём завершения — без Wait() wg.Done() выше срабатывал бы
-	// раньше, чем действительно заканчивается текущий запрос, и caller мог
-	// unregister-ить метрику или переиспользовать prevLabels пока старая
-	// горутина ещё пишет в них.
-	defer func() {
-		runner.cancelCurrent()
-		runner.currentWg.Wait()
-	}()
-
 	if queryCfg.Schedule != nil {
 		loc, entries, err := parseSchedule(queryCfg.Schedule)
 		if err != nil {
@@ -65,7 +55,7 @@ func startQueryWorker(
 				logger.Info("stopping query worker", "query", metricName, "db", queryCfg.DB)
 				return
 			case <-timer.C:
-				runner.run(queryCfg, db, timeout)
+				*prevLabels = runOnce(ctx, logger, name, queryCfg, db, timeout, *prevLabels)
 			}
 		}
 	}
@@ -83,7 +73,7 @@ func startQueryWorker(
 
 	// Первый запуск сразу, не дожидаясь тика — иначе /metrics пуст до
 	// interval секунд после каждого старта/рестарта воркера.
-	runner.run(queryCfg, db, timeout)
+	runIntervalTick(ctx, logger, name, metricName, queryCfg, db, timeout, interval, prevLabels)
 
 	for {
 		select {
@@ -91,52 +81,36 @@ func startQueryWorker(
 			logger.Info("stopping query worker", "query", metricName, "db", queryCfg.DB)
 			return
 		case <-ticker.C:
-			runner.run(queryCfg, db, timeout)
+			// Выполняем синхронно, в этой же горутине — пока runOnce занят,
+			// select ничего не читает из ticker.C, и Go сам отбрасывает
+			// пропущенные тики (не копит их в очередь). Это даёт
+			// "пропустить, если предыдущий ещё выполняется" бесплатно: если
+			// query занимает дольше interval, следующие срабатывания тикера
+			// просто не встают в очередь, а не запускают наложенное
+			// выполнение поверх текущего.
+			runIntervalTick(ctx, logger, name, metricName, queryCfg, db, timeout, interval, prevLabels)
 		}
 	}
 }
 
-// singleRunner гарантирует не более одного выполнения запроса одновременно:
-// run() отменяет предыдущий и запускает новый в горутине.
-type singleRunner struct {
-	parentCtx     context.Context
-	logger        *slog.Logger
-	name          string
-	cancelCurrent context.CancelFunc
-	currentWg     sync.WaitGroup
-
-	// prevLabels — указатель, а не значение: старый и новый воркер при
-	// hot-reload смотрят на одну память. cancelCurrent+Wait гарантируют,
-	// что старая горутина закончила до того как новая начнёт её читать/писать.
-	prevLabels *[]prometheus.Labels
-}
-
-func newSingleRunner(parentCtx context.Context, logger *slog.Logger, name string, prevLabels *[]prometheus.Labels) *singleRunner {
-	return &singleRunner{
-		parentCtx:     parentCtx,
-		logger:        logger,
-		name:          name,
-		cancelCurrent: func() {},
-		prevLabels:    prevLabels,
+// runIntervalTick выполняет один запуск interval-запроса и предупреждает,
+// если он не уложился в свой же interval — следующие тики в это время
+// молча пропускались (см. комментарий в startQueryWorker).
+func runIntervalTick(
+	ctx context.Context,
+	logger *slog.Logger,
+	name, metricName string,
+	queryCfg QueryConfig,
+	db *sql.DB,
+	timeout, interval time.Duration,
+	prevLabels *[]prometheus.Labels,
+) {
+	start := time.Now()
+	*prevLabels = runOnce(ctx, logger, name, queryCfg, db, timeout, *prevLabels)
+	if elapsed := time.Since(start); elapsed > interval {
+		logger.Warn("query took longer than its own interval — some ticks were skipped while it was running",
+			"query", metricName, "db", queryCfg.DB, "elapsed", elapsed, "interval", interval)
 	}
-}
-
-func (r *singleRunner) run(queryCfg QueryConfig, db *sql.DB, timeout time.Duration) {
-	r.cancelCurrent()
-	r.currentWg.Wait()
-
-	runCtx, cancel := context.WithCancel(r.parentCtx)
-	r.cancelCurrent = cancel
-
-	r.currentWg.Add(1)
-	go func() {
-		defer r.currentWg.Done()
-		if runCtx.Err() != nil {
-			return
-		}
-		updated := runOnce(runCtx, r.logger, r.name, queryCfg, db, timeout, *r.prevLabels)
-		*r.prevLabels = updated
-	}()
 }
 
 // runOnce выполняет один запуск и возвращает обновлённый prevLabels
@@ -174,7 +148,8 @@ func runOnce(
 		reason := classifyError(ctx, queryCtx, runErr)
 
 		if reason == "cancelled" {
-			logger.Info("query cancelled by next tick", "query", metricName, "db", queryCfg.DB, "elapsed", duration)
+			logger.Info("query cancelled — worker is stopping (shutdown, reload, or query removed)",
+				"query", metricName, "db", queryCfg.DB, "elapsed", duration)
 			return prevLabels
 		}
 
@@ -204,7 +179,9 @@ func runOnce(
 // схему, а не чинить сетевой доступ до БД).
 var errSchemaMismatch = errors.New("label set mismatch")
 
-// classifyError: "cancelled" (отменён следующим тиком) | "timeout"
+// classifyError: "cancelled" (воркер останавливается — shutdown/reload/
+// удаление запроса, не наложение тиков — см. startQueryWorker, оно теперь
+// просто пропускает тик, если предыдущий ещё выполняется) | "timeout"
 // (queryCtx истёк) | "schema_mismatch" (runtime-колонки SQL не совпали с уже
 // зарегистрированной метрикой) | "db_error" (остальное).
 func classifyError(workerCtx, queryCtx context.Context, runErr error) string {

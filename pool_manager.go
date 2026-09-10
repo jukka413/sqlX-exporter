@@ -9,6 +9,17 @@ import (
 	"time"
 )
 
+// intPtrEqual сравнивает *int по значению, а не по адресу — прямое `!=`
+// на двух *int сравнивало бы указатели: перепарсенный при каждом reload
+// YAML всегда аллоцирует новый *int, даже если число в нём не изменилось,
+// и наивное сравнение считало бы это изменением каждый раз.
+func intPtrEqual(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
 // dbPool связывает *sql.DB с конфигом, из которого он был создан.
 type dbPool struct {
 	cfg DBConfig
@@ -130,8 +141,8 @@ func (pm *poolManager) applyConfig(revision uint64, dbs map[string]DBConfig) (to
 		needUpdate := !exists ||
 			old.cfg.Driver != dbCfg.Driver ||
 			old.cfg.URL != dbCfg.URL ||
-			old.cfg.MaxConns != dbCfg.MaxConns ||
-			old.cfg.MaxIdleConns != dbCfg.MaxIdleConns ||
+			!intPtrEqual(old.cfg.MaxConns, dbCfg.MaxConns) ||
+			!intPtrEqual(old.cfg.MaxIdleConns, dbCfg.MaxIdleConns) ||
 			old.cfg.MaxConnLifetime != dbCfg.MaxConnLifetime ||
 			old.cfg.MaxConnIdleTime != dbCfg.MaxConnIdleTime
 
