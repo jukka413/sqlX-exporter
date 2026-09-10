@@ -16,21 +16,13 @@ type dbPool struct {
 }
 
 // poolManager — единственный владелец подключений к БД; только он вызывает
-// sql.DB.Close(). pools, failedPools и revision всегда мутируются вместе
-// под одним локом (applyConfig, commitReconnect) — это гарантирует, что
-// reconnect-попытка, снявшая (revision, failedPools) единым снэпшотом,
-// не может увидеть их в рассинхронизированном состоянии при повторной
-// проверке перед коммитом.
+// sql.DB.Close(). pools, failedPools и revision всегда мутируются вместе под
+// одним локом — reconnect-попытка, снявшая их единым снэпшотом, не может
+// увидеть рассинхронизированную пару при повторной проверке перед коммитом.
 //
-// revision не генерируется здесь — его присваивает app.reload() (см. поле
-// app.revision), тем же значением, что и workerManager в этом же вызове.
-// Так poolManager и workerManager всегда штампуются ОДНИМ числом за один
-// reload — раньше у каждого было своё независимое понятие "актуальности"
-// (generation у пула, lastQueries без версии у воркеров), и health-checker
-// мог снять их снэпшоты в момент когда reload обновил одно, но ещё не
-// другое — рассинхронизированная пара проходила бы проверку "не устарело"
-// каждая сама по себе, хотя вместе они уже не описывали согласованное
-// состояние.
+// revision присваивает app.reload() (см. app.revision), тем же значением,
+// что и workerManager в этом же вызове — оба менеджера штампуются одним
+// числом за один reload, а не независимо друг от друга.
 type poolManager struct {
 	ctx    context.Context
 	logger *slog.Logger
@@ -76,6 +68,21 @@ func (pm *poolManager) snapshotForReconnect() (uint64, map[string]DBConfig) {
 		failed[k] = v
 	}
 	return pm.revision, failed
+}
+
+// pendingDBs возвращает имена БД, для которых текущий пул НЕ соответствует
+// последнему желаемому конфигу (новый кандидат не подключился, работает
+// удержанный старый пул, если он был). workerManager использует это чтобы
+// не применять новый QueryConfig к запросам на такие БД — иначе новый SQL
+// мог бы выполниться на пуле, который физически ведёт к другой БД.
+func (pm *poolManager) pendingDBs() map[string]struct{} {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	out := make(map[string]struct{}, len(pm.failedPools))
+	for name := range pm.failedPools {
+		out[name] = struct{}{}
+	}
+	return out
 }
 
 // dial открывает и пингует соединение. Не трогает состояние poolManager —
@@ -184,13 +191,10 @@ func (pm *poolManager) updateDBUpMetrics() {
 		dbUp.WithLabelValues(name).Set(1)
 	}
 	for name := range failed {
-		// БД может быть одновременно и в pools (старое соединение всё ещё
-		// работает), и в failed (новый кандидат конфига не подключился) —
-		// это намеренное graceful degradation в applyConfig. app_db_up
-		// должен отражать "есть ли СЕЙЧАС рабочее соединение", а не
-		// "применился ли последний кандидат конфига" — иначе метрика
-		// показывала бы 0 в момент, когда экспортёр реально продолжает
-		// успешно собирать данные через старый pool.
+		// БД может быть и в pools (старое соединение работает), и в failed
+		// (новый кандидат конфига не подключился) — намеренное graceful
+		// degradation в applyConfig. Метрика должна отражать "есть ли
+		// рабочее соединение сейчас", не "применился ли последний кандидат".
 		if _, hasWorkingPool := pools[name]; hasWorkingPool {
 			continue
 		}

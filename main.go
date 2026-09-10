@@ -70,12 +70,9 @@ func main() {
 		}
 	}()
 
-	// bgWG отслеживает ВСЕ фоновые горутины (не только watcher, как было
-	// раньше) — иначе stopAllWorkers/closeAllPools могли начаться пока
-	// poolHealthChecker ещё в середине dial/reconcile или metricsUpdater
-	// ещё итерируется по пулам, которые вот-вот закроют. Обе горутины уже
-	// корректно возвращаются по ctx.Done() — здесь только дожидаемся этого
-	// перед тем как продолжить teardown.
+	// bgWG дожидается всех фоновых горутин перед teardown — иначе
+	// stopAllWorkers/closeAllPools могли бы начаться пока poolHealthChecker
+	// ещё в середине dial/reconcile.
 	var bgWG sync.WaitGroup
 
 	bgWG.Add(1)
@@ -84,12 +81,9 @@ func main() {
 		a.pm.metricsUpdater(5 * time.Second)
 	}()
 
-	// Первый reload уже публикует директории для watcher через a.watchDirsCh
-	// и выставляет a.reconnectInterval из реального конфига. poolHealthChecker
-	// стартует ПОСЛЕ этого, не до — иначе его тикер создавался бы с
-	// захардкоженным дефолтом 5 минут из newApp(), и настоящее значение
-	// db_reconnect_interval применилось бы только на первом естественном
-	// тике старого тикера, каким бы коротким ни был интервал в конфиге.
+	// poolHealthChecker стартует после первого reload — иначе его тикер
+	// создавался бы с дефолтом 5 минут из newApp(), а не реальным
+	// db_reconnect_interval из конфига.
 	a.reload()
 
 	bgWG.Add(1)

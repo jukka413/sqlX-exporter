@@ -182,13 +182,9 @@ func loadConfig(path string) (Config, error) {
 }
 
 // normalizeDrivers приводит driver каждой БД к нижнему регистру и обрезает
-// пробелы. Без этого валидация (сравнивающая через ToLower) и рантайм
-// расходились бы: sql.Open требует ТОЧНОГО совпадения регистра с тем именем,
-// под которым драйвер зарегистрировал себя (см. drivers.go) — "driver: PGX"
-// проходил бы validateDatabasesAndSettings, но падал в sql.Open("PGX", ...)
-// с "unknown driver". Нормализация здесь, один раз, в единственной точке
-// где конфиг финализируется — дальше по всему коду (валидация, pool_manager,
-// db.go) driver уже гарантированно в каноническом виде.
+// пробелы. sql.Open требует точного совпадения регистра с именем, под
+// которым драйвер зарегистрировал себя (см. drivers.go) — без этого
+// "driver: PGX" проходил бы валидацию, но падал в рантайме.
 func normalizeDrivers(cfg *Config) {
 	for name, db := range cfg.Databases {
 		db.Driver = strings.ToLower(strings.TrimSpace(db.Driver))
@@ -326,12 +322,9 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 				continue
 			}
 			if len(dbs) == 0 {
-				// Запись есть, но список БД пуст ("file.yaml: []") — цикл
-				// ниже не выполнится ни разу, и без этой явной проверки
-				// инклюд тихо пропадал бы, не попадая ни в skippedIncludes,
-				// ни в failedIncludes — то же самое молчаливое отключение,
-				// с которым мы уже боремся для "нет записи вообще", просто
-				// с другой причиной.
+				// Запись есть, но список пуст ("file.yaml: []") — цикл ниже
+				// не выполнится ни разу; без этой проверки инклюд тихо
+				// пропадал бы, не попадая никуда.
 				cfg.skippedIncludes = append(cfg.skippedIncludes,
 					fmt.Sprintf("%q: include_defaults entry is an empty list — no databases to apply this file to", includePath))
 				continue

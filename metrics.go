@@ -87,11 +87,8 @@ var (
 	)
 
 	// queryHealthSchemaConflict — 1 пока у запроса конфликт схемы лейблов
-	// (labels/value_column изменились в конфиге, но Prometheus не позволяет
-	// применить это без рестарта — см. комментарий в workerManager.reconcile).
-	// Отсутствие серии = нет конфликта; появление и удаление серии, а не
-	// просто её значение, потому что цель — не пропустить это в логах,
-	// которые часто не читают построчно, а увидеть прямо на дашборде.
+	// (см. workerManager.reconcile). Отсутствие серии, а не 0 — так проще
+	// заметить на дашборде, не читая логи построчно.
 	queryHealthSchemaConflict = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "app_query_schema_conflict",

@@ -30,15 +30,9 @@ type app struct {
 	reloadMu sync.Mutex
 
 	// revision — счётчик применённой конфигурации, растёт на 1 в начале
-	// каждого reload(). Одним и тем же значением в одном reload штампуются
-	// и poolManager (applyConfig), и workerManager (reconcile) — см.
-	// комментарий у poolManager. poolHealthChecker сверяет revision обоих
-	// менеджеров перед тем как реконсилировать воркеры после реконнекта:
-	// если они разошлись, значит health-checker снял снэпшоты в момент
-	// когда reload() уже обновил один из менеджеров, но ещё не второй —
-	// раньше это могло привести к тому что health-checker реконсилировал
-	// воркеры по снэпшоту queries, снятому ДО применения текущего reload,
-	// то есть эффективно откатывал только что применённые изменения.
+	// каждого reload(). Одним значением в одном reload штампуются и
+	// poolManager (applyConfig), и workerManager (reconcile) — см.
+	// комментарий у poolManager.
 	revision uint64
 
 	// configReady — успешно ли прошёл хотя бы один reload (структурная
@@ -149,20 +143,17 @@ func (a *app) poolHealthChecker() {
 				a.logger.Info("db reconnected", "db", name)
 				a.pm.updateDBUpMetrics()
 
-				// Снэпшот queries берём здесь, а не в начале тика — сжимает
-				// окно, в котором он может относиться к другому revision чем
-				// только что закоммиченный пул (см. комментарий у app.revision).
-				// Передаём queriesRev в reconcile, а не rev пула — если они
-				// разошлись, wm.lastQueriesRevision должен честно отражать
-				// ревизию ПЕРЕДАННЫХ queries, а не создавать видимость что
-				// воркеры уже на актуальном состоянии.
+				// Снэпшот queries берём здесь, не в начале тика — сжимает окно
+				// рассинхрона с revision пула. Передаём queriesRev, не rev
+				// пула: wm.lastQueriesRevision должен честно отражать
+				// ревизию переданных queries.
 				queries, queriesRev := a.wm.snapshotLastQueries()
 				if queriesRev != rev {
 					a.logger.Warn("worker state revision does not match pool revision right after reconnect — "+
 						"reconciling with the best available snapshot, a concurrent reload will correct this shortly",
 						"db", name, "pool_revision", rev, "worker_revision", queriesRev)
 				}
-				stats := a.wm.reconcile(queriesRev, queries, a.pm.snapshotPools(), a.getDefaultDB())
+				stats := a.wm.reconcile(queriesRev, queries, a.pm.snapshotPools(), a.pm.pendingDBs(), a.getDefaultDB())
 				a.logger.Info("workers reconciled after reconnect", "db", name,
 					"queries_started", stats.Started, "queries_restarted", stats.Restarted)
 
@@ -234,7 +225,7 @@ func (a *app) reload() {
 
 	// reconcile ДО закрытия старых пулов — иначе воркер может тикнуть в
 	// окне между Close() и остановкой воркера и получить "database is closed".
-	stats := a.wm.reconcile(rev, newCfg.Queries, a.pm.snapshotPools(), a.getDefaultDB())
+	stats := a.wm.reconcile(rev, newCfg.Queries, a.pm.snapshotPools(), a.pm.pendingDBs(), a.getDefaultDB())
 
 	a.pm.closePools(toClose)
 	a.pm.deletePoolMetrics(removedDBs)
@@ -242,9 +233,11 @@ func (a *app) reload() {
 	// success только если реально ВСЁ применилось; наличие failedIncludes
 	// означает что часть конфига (запросы/БД одного или нескольких файлов)
 	// не была применена — раньше это всё равно писалось как "success",
-	// хотя app_config_include_failures уже мог быть > 0.
+	// хотя app_config_include_failures уже мог быть > 0. Pending-запросы —
+	// та же история: их желаемый конфиг не применился, потому что новая
+	// БД не подключилась.
 	result := "success"
-	if len(newCfg.failedIncludes) > 0 {
+	if len(newCfg.failedIncludes) > 0 || stats.Pending > 0 {
 		result = "partial_success"
 	}
 	configReloadTotal.WithLabelValues(result).Inc()
@@ -257,6 +250,7 @@ func (a *app) reload() {
 		"queries_restarted", stats.Restarted,
 		"queries_stopped", stats.Stopped,
 		"queries_unchanged", stats.Unchanged,
+		"queries_pending", stats.Pending,
 	)
 }
 
