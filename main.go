@@ -81,6 +81,12 @@ func main() {
 		a.pm.metricsUpdater(5 * time.Second)
 	}()
 
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		a.pm.activeHealthCheck(30 * time.Second)
+	}()
+
 	// watchConfig запускается и дожидается установки watch ДО первого
 	// reload — иначе reload() (может занимать секунды на несколько БД)
 	// оставлял бы окно, в которое ConfigMap мог обновиться незамеченным:

@@ -183,7 +183,10 @@ func (pm *poolManager) applyConfig(revision uint64, dbs map[string]DBConfig) (to
 	return toClose, removedDBs
 }
 
-// updateDBUpMetrics публикует app_db_up для каждой известной БД.
+// updateDBUpMetrics публикует app_db_up для каждой известной БД — быстрый,
+// немедленный сигнал сразу при (пере)подключении. Периодически значение
+// дополнительно перепроверяется активным пингом (см. poolManager.activeHealthCheck),
+// иначе "1" отсюда так и остался бы навсегда, даже если соединение потом тихо умрёт.
 func (pm *poolManager) updateDBUpMetrics() {
 	pools := pm.snapshotPools()
 	_, failed := pm.snapshotForReconnect()
@@ -265,6 +268,42 @@ func (pm *poolManager) metricsUpdater(period time.Duration) {
 				dbPoolAcquired.WithLabelValues(name).Set(float64(stat.InUse))
 				dbPoolIdle.WithLabelValues(name).Set(float64(stat.Idle))
 				dbPoolTotal.WithLabelValues(name).Set(float64(stat.OpenConnections))
+			}
+		}
+	}
+}
+
+// activeHealthCheck периодически пингует каждый активный пул и обновляет
+// app_db_up по результату. Без этого app_db_up отражал бы только "когда-то
+// подключились успешно" — sql.DB.Stats() (см. metricsUpdater) сообщает
+// состояние пула соединений, а не то, отвечает ли сервер сейчас; тихо
+// умершая сеть оставила бы app_db_up=1 бесконечно, пока какой-нибудь
+// query не наткнётся на неё сам. Отдельная, более редкая горутина —
+// в отличие от Stats() (чисто локальная операция), Ping — реальный
+// сетевой запрос к БД, не хочется слать его так же часто, как читаем
+// статистику пула.
+func (pm *poolManager) activeHealthCheck(period time.Duration) {
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-pm.ctx.Done():
+			return
+		case <-ticker.C:
+			for name, p := range pm.snapshotPools() {
+				if p == nil || p.db == nil {
+					continue
+				}
+				pingCtx, cancel := context.WithTimeout(pm.ctx, 5*time.Second)
+				err := p.db.PingContext(pingCtx)
+				cancel()
+				if err != nil {
+					pm.logger.Warn("active health check failed", "db", name, "error", err)
+					dbUp.WithLabelValues(name).Set(0)
+					continue
+				}
+				dbUp.WithLabelValues(name).Set(1)
 			}
 		}
 	}

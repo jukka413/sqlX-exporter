@@ -75,13 +75,18 @@ var (
 		Help: "Unix timestamp of the last successful config reload",
 	})
 
-	// dbUp — 1 если пул рабочий, 0 если БД в failedPools. Существует для
-	// каждой БД конфига всегда, в отличие от app_query_up, которой может не
-	// быть если ни один воркер для этой БД не стартовал.
+	// dbUp — обновляется в двух местах: сразу при (пере)подключении (см.
+	// updateDBUpMetrics) для быстрой положительной реакции, и периодически
+	// activeHealthCheck'ом через реальный PingContext — иначе значение
+	// отражало бы только факт "когда-то подключились", а не текущую
+	// доступность: тихо умершая сеть держала бы 1 бесконечно, пока
+	// какой-нибудь query не наткнётся на неё сам. Существует для каждой БД
+	// конфига всегда, в отличие от app_query_up, которой может не быть,
+	// если ни один воркер для этой БД не стартовал.
 	dbUp = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "app_db_up",
-			Help: "1 if the database currently has a working connection pool, 0 if it is failing to connect",
+			Help: "1 if the last health check (active ping) for this database succeeded, 0 otherwise",
 		},
 		[]string{"db"},
 	)
