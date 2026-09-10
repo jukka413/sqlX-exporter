@@ -25,7 +25,7 @@ func main() {
 	appCtx, appCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer appCancel()
 
-	a := newApp(appCtx, appCancel, logger, *configPath)
+	a := newApp(appCtx, logger, *configPath)
 
 	// ---- Metrics server ----
 	mux := http.NewServeMux()

@@ -11,11 +11,20 @@ import (
 // app — тонкий оркестратор: координирует poolManager (владелец *sql.DB) и
 // workerManager (владелец воркеров) в правильном порядке. Сам не хранит
 // пулы/воркеры.
+//
+// Lock order (всегда снаружи внутрь, никогда наоборот):
+//
+//	reloadMu (только вокруг reload())
+//	    -> stateMu
+//	        -> poolManager.transitionMu -> poolManager.mu
+//	        -> workerManager.reconcileMu -> workerManager.mu
+//
+// Ни один метод poolManager/workerManager не берёт app.stateMu — они ничего
+// не знают о его существовании. Захват идёт только сверху, из app.
 type app struct {
 	logger *slog.Logger
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx context.Context
 
 	configPath string
 
@@ -28,6 +37,20 @@ type app struct {
 
 	// reloadMu не даёт reload() выполниться параллельно самому себе.
 	reloadMu sync.Mutex
+
+	// stateMu сериализует переход состояния целиком — и коммит пулов, и
+	// реконсиляцию воркеров — как один неделимый блок, для обоих путей
+	// применения конфига (reload и reconnect). Без него между коммитом
+	// poolManager и вызовом workerManager.reconcile есть зазор в несколько
+	// инструкций, в который может втиснуться конкурентный commitReconnect:
+	// он увидит уже обновлённый pm.revision, но ещё не обновлённый
+	// wm.lastQueriesRevision, и реконсилирует новые пулы со старыми
+	// desired-запросами. Stale-revision guard внутри workerManager.reconcile
+	// этот конкретный случай не ловит — там revision формально не "старее"
+	// уже применённой, она просто отстаёт от pm на долю секунды. dial()
+	// (сетевой I/O) остаётся вне stateMu в обоих путях — под локом только
+	// сам commit.
+	stateMu sync.Mutex
 
 	// revision — счётчик применённой конфигурации, растёт на 1 в начале
 	// каждого reload(). Одним значением в одном reload штампуются и
@@ -46,11 +69,10 @@ type app struct {
 	watchDirsCh chan []string
 }
 
-func newApp(ctx context.Context, cancel context.CancelFunc, logger *slog.Logger, configPath string) *app {
+func newApp(ctx context.Context, logger *slog.Logger, configPath string) *app {
 	return &app{
 		logger:            logger,
 		ctx:               ctx,
-		cancel:            cancel,
 		configPath:        configPath,
 		pm:                newPoolManager(ctx, logger),
 		wm:                newWorkerManager(ctx, logger),
@@ -133,8 +155,14 @@ func (a *app) poolHealthChecker() {
 					continue
 				}
 
+				// commitReconnect + reconcile — тот же неделимый блок под
+				// stateMu, что и в reload() (см. комментарий у поля). dial
+				// выше — сетевой I/O, специально вне лока.
+				a.stateMu.Lock()
+
 				oldPool, ok := a.pm.commitReconnect(name, dbCfg, rev, db)
 				if !ok {
+					a.stateMu.Unlock()
 					a.logger.Info("discarding stale reconnect result — config changed during dial", "db", name)
 					_ = db.Close()
 					continue
@@ -143,19 +171,23 @@ func (a *app) poolHealthChecker() {
 				a.logger.Info("db reconnected", "db", name)
 				a.pm.updateDBUpMetrics()
 
-				// Снэпшот queries берём здесь, не в начале тика — сжимает окно
-				// рассинхрона с revision пула. Передаём queriesRev, не rev
-				// пула: wm.lastQueriesRevision должен честно отражать
-				// ревизию переданных queries.
 				queries, queriesRev := a.wm.snapshotLastQueries()
 				if queriesRev != rev {
-					a.logger.Warn("worker state revision does not match pool revision right after reconnect — "+
-						"reconciling with the best available snapshot, a concurrent reload will correct this shortly",
+					// Под stateMu commitReconnect и reconcile всегда идут одним
+					// блоком — если revision тут разошлись, это не тайминг,
+					// а нарушение самого инварианта stateMu где-то ещё.
+					// Реконсилировать в таком состоянии небезопасно.
+					a.logger.Error("worker state revision does not match pool revision right after "+
+						"reconnect under stateMu — this should be impossible, skipping reconcile",
 						"db", name, "pool_revision", rev, "worker_revision", queriesRev)
+					a.stateMu.Unlock()
+					continue
 				}
 				stats := a.wm.reconcile(queriesRev, queries, a.pm.snapshotPools(), a.pm.pendingDBs(), a.getDefaultDB())
 				a.logger.Info("workers reconciled after reconnect", "db", name,
 					"queries_started", stats.Started, "queries_restarted", stats.Restarted)
+
+				a.stateMu.Unlock()
 
 				// После reconcile — он гарантированно останавливает воркеры,
 				// использующие старый пул, прежде чем этот пул закрывается.
@@ -210,6 +242,13 @@ func (a *app) reload() {
 		}
 	}
 
+	// Всё от увеличения revision до reconcile — один неделимый блок под
+	// stateMu (см. комментарий у поля). dial внутри applyConfig может занять
+	// секунды на несколько БД — это осознанная цена: без stateMu на всю эту
+	// секцию оставался бы зазор, в который мог втиснуться commitReconnect
+	// с уже новым pm.revision, но ещё старым wm.lastQueriesRevision.
+	a.stateMu.Lock()
+
 	a.mu.Lock()
 	a.revision++
 	rev := a.revision
@@ -227,6 +266,10 @@ func (a *app) reload() {
 	// окне между Close() и остановкой воркера и получить "database is closed".
 	stats := a.wm.reconcile(rev, newCfg.Queries, a.pm.snapshotPools(), a.pm.pendingDBs(), a.getDefaultDB())
 
+	a.stateMu.Unlock()
+
+	// Закрытие старых пулов — уже безопасно вне stateMu: reconcile выше
+	// гарантированно остановил все воркеры, которые их использовали.
 	a.pm.closePools(toClose)
 	a.pm.deletePoolMetrics(removedDBs)
 
