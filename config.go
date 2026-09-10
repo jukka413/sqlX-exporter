@@ -154,24 +154,26 @@ type ScheduleAt struct {
 }
 
 // loadConfig загружает конфиг из path и рекурсивно обрабатывает includes.
+//
+// Корневой файл читается ровно один раз, внутри loadConfigWithContext на
+// depth==0 — раньше здесь был отдельный "preview"-проход, читающий тот же
+// файл ещё раз только чтобы заранее вытащить default_db/include_defaults.
+// Два раздельных os.ReadFile одного и того же файла не атомарны друг
+// относительно друга: если содержимое на диске поменяется между ними
+// (например Kubernetes переключил ..data ровно в этот момент), итоговый
+// cfg мог оказаться собран из ДВУХ разных версий файла одновременно —
+// в частности mergeIncludeDefaults(base, override) только перезаписывает
+// совпадающие ключи, а не заменяет карту целиком, поэтому ключ, удалённый
+// в новой версии, мог "воскреснуть" из значения preview-прохода, снятого
+// со старой.
 func loadConfig(path string) (Config, error) {
-	var preview Config
-	data, err := os.ReadFile(path)
-	if err == nil {
-		_ = yaml.Unmarshal(data, &preview)
-	}
-	globalDefault := preview.DefaultDB
-	if globalDefault == "" {
-		globalDefault = preview.Settings.DefaultDB
-	}
-
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		absPath = path
 	}
 	rootDir := filepath.Dir(absPath)
 
-	cfg, err := loadConfigWithContext(path, 0, globalDefault, preview.IncludeDefaults, rootDir)
+	cfg, err := loadConfigWithContext(path, 0, "", nil, rootDir)
 	if err != nil {
 		return cfg, err
 	}
@@ -265,7 +267,17 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 		}
 	}
 
+	// settings.default_db как фолбэк — только для корневого файла (depth==0).
+	// Раньше это вычислялось в loadConfig() из отдельного preview-чтения;
+	// теперь берётся из этого же, единственного чтения cfg. Ограничение по
+	// depth сохраняет прежнюю семантику: settings.default_db инклюда сам по
+	// себе не становится "родительским" фолбэком для остальных файлов —
+	// таким фолбэком был (и остаётся) только default_db/settings.default_db
+	// корневого конфига.
 	effectiveDefaultDB := cfg.DefaultDB
+	if depth == 0 && effectiveDefaultDB == "" {
+		effectiveDefaultDB = cfg.Settings.DefaultDB
+	}
 	if effectiveDefaultDB == "" {
 		effectiveDefaultDB = parentDefaultDB
 	}
