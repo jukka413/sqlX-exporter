@@ -88,13 +88,17 @@ var (
 
 	// queryHealthSchemaConflict — 1 пока у запроса конфликт схемы лейблов
 	// (см. workerManager.reconcile). Отсутствие серии, а не 0 — так проще
-	// заметить на дашборде, не читая логи построчно.
+	// заметить на дашборде, не читая логи построчно. Ключ {query,db}, не
+	// только {query} — при клонировании на несколько БД клоны одного
+	// источника могут разойтись состоянием после рестарта (одному пул
+	// заменили, другому нет), и общий ключ на всех позволил бы одному
+	// клону стереть сигнал, актуальный для другого.
 	queryHealthSchemaConflict = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "app_query_schema_conflict",
 			Help: "1 if the running query's label schema conflicts with its current config and cannot be applied without a process restart",
 		},
-		[]string{"query"},
+		[]string{"query", "db"},
 	)
 
 	queryDuration = prometheus.NewHistogramVec(

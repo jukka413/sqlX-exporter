@@ -54,11 +54,12 @@ func (wm *workerManager) snapshotLastQueries() (map[string]QueryConfig, uint64) 
 
 // ReconcileStats — что сделал reconcile, для содержательного лога после reload.
 type ReconcileStats struct {
-	Started   int
-	Restarted int
-	Stopped   int
-	Unchanged int
-	Pending   int // заморожено на старом конфиге, потому что БД pending
+	Started         int
+	Restarted       int
+	Stopped         int
+	Unchanged       int
+	Pending         int // заморожено на старом конфиге, потому что БД pending
+	SchemaConflicts int // конфликт схемы лейблов — заморожен или остановлен
 }
 
 // reconcile приводит воркеры в соответствие с queries. revision — то же
@@ -134,12 +135,7 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 					"changing a metric's label schema without a process restart; the entire query "+
 					"config is frozen at its last working state until restart",
 				"query", name, "db", q.DB)
-			if w.cfg.MetricName != "" {
-				queryHealthSchemaConflict.WithLabelValues(w.cfg.MetricName).Set(1)
-			}
 			q = w.cfg
-		} else if exists && w.cfg.MetricName != "" {
-			queryHealthSchemaConflict.DeleteLabelValues(w.cfg.MetricName)
 		}
 
 		pEntry, ok := pools[q.DB]
@@ -159,10 +155,25 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 			wm.logger.Error("schema conflict AND the underlying db pool also changed in this reload — "+
 				"cannot safely keep running the frozen query against a different db endpoint, stopping",
 				"query", name, "db", q.DB)
+			stats.SchemaConflicts++
 			if wm.stopWorker(name) {
 				stats.Stopped++
 			}
 			continue
+		}
+
+		// Гейдж конфликта выставляем только теперь, когда точно знаем что
+		// воркер остаётся жив (заморожен, но не остановлен) — иначе для
+		// случая выше (стоп из-за смены пула) гейдж мигнул бы Set(1) и тут
+		// же DeleteLabelValues внутри stopWorker в рамках одного и того же
+		// прохода, и ни один реальный scrape не успел бы его увидеть.
+		if schemaChanged {
+			if w.cfg.MetricName != "" {
+				queryHealthSchemaConflict.WithLabelValues(w.cfg.MetricName, w.cfg.DB).Set(1)
+			}
+			stats.SchemaConflicts++
+		} else if exists && w.cfg.MetricName != "" {
+			queryHealthSchemaConflict.DeleteLabelValues(w.cfg.MetricName, w.cfg.DB)
 		}
 
 		q.DBEnv = pEntry.cfg.Env
@@ -266,11 +277,13 @@ func (wm *workerManager) stopWorker(name string) bool {
 	if metricName != "" {
 		if !sharedByOthers {
 			unregisterQueryMetric(metricName)
-			queryHealthSchemaConflict.DeleteLabelValues(metricName)
 		} else {
 			deleteWorkerRows(stoppedCfg, stoppedPrevLabels)
 		}
 		deleteQueryHealthMetrics(metricName, stoppedCfg.DB)
+		// (query,db) уникален для этого воркера даже при клонировании —
+		// в отличие от бизнес-метрики, sharedByOthers тут не имеет значения.
+		queryHealthSchemaConflict.DeleteLabelValues(metricName, stoppedCfg.DB)
 	}
 	return true
 }

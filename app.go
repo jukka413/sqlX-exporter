@@ -284,11 +284,11 @@ func (a *app) reload() {
 	// success только если реально ВСЁ применилось; наличие failedIncludes
 	// означает что часть конфига (запросы/БД одного или нескольких файлов)
 	// не была применена — раньше это всё равно писалось как "success",
-	// хотя app_config_include_failures уже мог быть > 0. Pending-запросы —
-	// та же история: их желаемый конфиг не применился, потому что новая
-	// БД не подключилась.
+	// хотя app_config_include_failures уже мог быть > 0. Pending-запросы и
+	// конфликты схемы — та же история: желаемый конфиг не применился
+	// целиком, хотя reload формально прошёл без критической ошибки.
 	result := "success"
-	if len(newCfg.failedIncludes) > 0 || stats.Pending > 0 {
+	if len(newCfg.failedIncludes) > 0 || stats.Pending > 0 || stats.SchemaConflicts > 0 {
 		result = "partial_success"
 	}
 	configReloadTotal.WithLabelValues(result).Inc()
@@ -302,6 +302,7 @@ func (a *app) reload() {
 		"queries_stopped", stats.Stopped,
 		"queries_unchanged", stats.Unchanged,
 		"queries_pending", stats.Pending,
+		"queries_schema_conflicts", stats.SchemaConflicts,
 	)
 }
 
