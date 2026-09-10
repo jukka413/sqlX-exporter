@@ -171,7 +171,7 @@ func runOnce(
 	queryDuration.WithLabelValues(metricName, queryCfg.DB).Observe(duration)
 
 	if runErr != nil {
-		reason := classifyError(ctx, queryCtx)
+		reason := classifyError(ctx, queryCtx, runErr)
 
 		if reason == "cancelled" {
 			logger.Info("query cancelled by next tick", "query", metricName, "db", queryCfg.DB, "elapsed", duration)
@@ -197,14 +197,25 @@ func runOnce(
 	return nextPrevLabels
 }
 
+// errSchemaMismatch — сигнальная ошибка для label set mismatch (runtime-схема
+// SQL разошлась с уже зарегистрированным GaugeVec). Отдельная категория в
+// classifyError — иначе она неотличима на дашборде от обычной ошибки БД,
+// хотя причина и способ починки совершенно другие (нужно поправить SQL/
+// схему, а не чинить сетевой доступ до БД).
+var errSchemaMismatch = errors.New("label set mismatch")
+
 // classifyError: "cancelled" (отменён следующим тиком) | "timeout"
-// (queryCtx истёк) | "db_error" (остальное).
-func classifyError(workerCtx, queryCtx context.Context) string {
+// (queryCtx истёк) | "schema_mismatch" (runtime-колонки SQL не совпали с уже
+// зарегистрированной метрикой) | "db_error" (остальное).
+func classifyError(workerCtx, queryCtx context.Context, runErr error) string {
 	if workerCtx.Err() == context.Canceled {
 		return "cancelled"
 	}
 	if errors.Is(queryCtx.Err(), context.DeadlineExceeded) {
 		return "timeout"
+	}
+	if errors.Is(runErr, errSchemaMismatch) {
+		return "schema_mismatch"
 	}
 	return "db_error"
 }
@@ -244,7 +255,7 @@ func runSingleValue(
 	// существующий, зафиксированный ранее коллектор).
 	gauge, err := metric.GetMetricWith(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil))
 	if err != nil {
-		return fmt.Errorf("label set mismatch for metric %q: %w", name, err)
+		return fmt.Errorf("metric %q: %w: %w", name, errSchemaMismatch, err)
 	}
 	gauge.Set(value)
 
@@ -424,7 +435,7 @@ func runMultiRow(
 	for i, row := range buffered {
 		g, err := metric.GetMetricWith(row.labels)
 		if err != nil {
-			return nil, fmt.Errorf("label set mismatch for metric %q: %w", name, err)
+			return nil, fmt.Errorf("metric %q: %w: %w", name, errSchemaMismatch, err)
 		}
 		gauges[i] = g
 	}

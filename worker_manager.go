@@ -71,11 +71,9 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 	var stats ReconcileStats
 
 	wm.mu.Lock()
-	// reconcileMu сериализует вызовы, но не их порядок по revision —
-	// reconcile(R-1) может физически выполниться после reconcile(R), если
-	// health-checker снял свой снэпшот раньше, а дошёл до вызова позже.
-	// Без этой проверки такой запоздавший reconcile тихо откатил бы
-	// уже применённое состояние.
+	// reconcileMu сериализует вызовы, но не их порядок по revision — без
+	// этой проверки запоздавший reconcile(R-1) мог бы откатить уже
+	// применённый reconcile(R).
 	if revision < wm.lastQueriesRevision {
 		current := wm.lastQueriesRevision
 		wm.mu.Unlock()
@@ -105,19 +103,13 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 
 		w, exists := currentWorkers[name]
 
-		// pendingDBs: новый кандидат конфига для этой БД не подключился в
-		// этом reload — pools[q.DB], если он вообще есть, это УДЕРЖАННЫЙ
-		// старый пул, а не то, что реально хотел применить конфиг. Нельзя
-		// запускать НОВЫЙ QueryConfig на пуле, который физически ведёт к
-		// другой БД (URL мог смениться на другой хост/кластер) — иначе
-		// новый SQL выполнится не там, где рассчитывал оператор.
+		// pendingDBs: dial нового конфига этой БД провалился — pools[q.DB],
+		// если вообще есть, это удержанный старый пул. Нельзя применять
+		// новый QueryConfig к пулу, который не соответствует ему.
 		wasPending := false
 		if _, pending := pendingDBs[q.DB]; pending {
 			wasPending = true
 			if !exists {
-				// Этот запрос никогда раньше не выполнялся на этой БД —
-				// нет "последнего рабочего состояния", к которому можно
-				// откатиться. Просто не стартуем, пока БД не подключится.
 				wm.logger.Error("db config is pending (new candidate failed to connect) — "+
 					"not starting a new query on the stale fallback pool",
 					"query", name, "db", q.DB)
@@ -131,11 +123,9 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 		}
 
 		// Prometheus не позволяет поменять схему лейблов зарегистрированной
-		// метрики без рестарта процесса. Вместо гибрида (новый SQL со старым
-		// value_column, который тут же упал бы с "column not found") целиком
-		// замораживаем QueryConfig на последнем рабочем состоянии — не
-		// только Labels/ValueColumn, но и SQL/DB/timeout. Проверка идёт до
-		// резолва пула: замороженный q.DB может отличаться от нового.
+		// метрики без рестарта. Замораживаем весь QueryConfig на последнем
+		// рабочем состоянии (не только Labels/ValueColumn, но и SQL/DB) —
+		// иначе получился бы гибрид: новый SQL со старой схемой.
 		schemaChanged := exists &&
 			(w.cfg.ValueColumn != q.ValueColumn || !sameLabelKeys(w.cfg.Labels, q.Labels))
 		if schemaChanged {
@@ -155,19 +145,30 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 		pEntry, ok := pools[q.DB]
 		if !ok || pEntry == nil || pEntry.db == nil {
 			wm.logger.Error("db not available for query", "query", name, "db", q.DB)
-			// Останавливаем, а не оставляем на старой БД — её пул может
-			// быть закрыт этим же reload'ом через пару строк.
 			if wm.stopWorker(name) {
 				stats.Stopped++
 			}
 			continue
 		}
+
+		// Заморозка схемы фиксирует SQL, но не пул — pEntry резолвится заново
+		// по q.DB. Если URL этой же БД тоже сменился и новый хост подключился
+		// (pEntry — другой объект, не w.pool), крутить старый SQL на новом
+		// соединении небезопасно: это может быть физически другая БД.
+		if schemaChanged && w.pool != pEntry {
+			wm.logger.Error("schema conflict AND the underlying db pool also changed in this reload — "+
+				"cannot safely keep running the frozen query against a different db endpoint, stopping",
+				"query", name, "db", q.DB)
+			if wm.stopWorker(name) {
+				stats.Stopped++
+			}
+			continue
+		}
+
 		q.DBEnv = pEntry.cfg.Env
 
 		poolChanged := exists && w.pool != pEntry
 
-		// DB/env/значение лейбла изменились — данные переезжают на другую
-		// time series, старую нужно удалить явно.
 		identityChanged := exists &&
 			(w.cfg.DB != q.DB || w.cfg.DBEnv != q.DBEnv || !sameLabelValues(w.cfg.Labels, q.Labels))
 
@@ -269,9 +270,6 @@ func (wm *workerManager) stopWorker(name string) bool {
 		} else {
 			deleteWorkerRows(stoppedCfg, stoppedPrevLabels)
 		}
-		// (metricName, db) уникален для этого воркера даже при клонировании
-		// на несколько БД — в отличие от бизнес-метрики, sharedByOthers
-		// здесь не имеет значения.
 		deleteQueryHealthMetrics(metricName, stoppedCfg.DB)
 	}
 	return true

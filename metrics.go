@@ -202,8 +202,8 @@ func getOrCreateQueryMetric(queryName string, customLabels map[string]string, co
 		}
 		return nil, fmt.Errorf(
 			"metric %q: cannot register with the current label set — likely changed labels/value_column "+
-				"since first registration, or a name collision with another query; restart the process to fix: %w",
-			queryName, err)
+				"since first registration, or a name collision with another query; restart the process to fix: %w: %w",
+			queryName, errSchemaMismatch, err)
 	}
 
 	queryResultMetrics[queryName] = metric
