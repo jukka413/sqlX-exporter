@@ -23,10 +23,20 @@ import (
 // инклюд в ранее неотслеживаемой директории подхватывался без рестарта).
 // Директории только добавляются — лишний watch безвреден, события всё
 // равно фильтруются по конкретным файлам ниже.
-func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func(), updateDirs <-chan []string) {
+//
+// ready — канал, в который watchConfig отправляет ровно одно значение сразу
+// после того как watch на директорию основного конфига реально установлен
+// (nil — успех, иначе ошибка настройки). Нужен затем, что main() запускает
+// начальный a.reload() отдельно, и без этого сигнала между стартом
+// watchConfig и моментом когда watcher.Add() реально отработал есть окно:
+// если ConfigMap обновится именно в эту паузу, fsnotify историческое
+// событие не воспроизведёт задним числом, и exporter молча останется на
+// старой версии конфига до следующего изменения.
+func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func(), updateDirs <-chan []string, ready chan<- error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		logger.Error("failed to create watcher", "error", err)
+		ready <- err
 		return
 	}
 	defer func() {
@@ -40,6 +50,7 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		logger.Error("failed to resolve config path", "error", err)
+		ready <- err
 		return
 	}
 	absPath = filepath.Clean(absPath)
@@ -47,9 +58,11 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 
 	if err := watcher.Add(dir); err != nil {
 		logger.Error("failed to watch config directory", "dir", dir, "error", err)
+		ready <- err
 		return
 	}
 	logger.Info("watching config directory", "dir", dir, "file", absPath)
+	ready <- nil
 
 	watchedDirs := map[string]struct{}{dir: {}}
 

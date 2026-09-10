@@ -81,6 +81,22 @@ func main() {
 		a.pm.metricsUpdater(5 * time.Second)
 	}()
 
+	// watchConfig запускается и дожидается установки watch ДО первого
+	// reload — иначе reload() (может занимать секунды на несколько БД)
+	// оставлял бы окно, в которое ConfigMap мог обновиться незамеченным:
+	// fsnotify не воспроизводит события задним числом, и exporter молча
+	// остался бы на старой версии конфига до следующего изменения.
+	watcherReady := make(chan error, 1)
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		watchConfig(a.ctx, a.logger, a.configPath, a.reload, a.watchDirsCh, watcherReady)
+	}()
+	if err := <-watcherReady; err != nil {
+		logger.Error("failed to set up config watcher — hot-reload will not work, "+
+			"continuing with a one-time config load", "error", err)
+	}
+
 	// poolHealthChecker стартует после первого reload — иначе его тикер
 	// создавался бы с дефолтом 5 минут из newApp(), а не реальным
 	// db_reconnect_interval из конфига.
@@ -90,12 +106,6 @@ func main() {
 	go func() {
 		defer bgWG.Done()
 		a.poolHealthChecker()
-	}()
-
-	bgWG.Add(1)
-	go func() {
-		defer bgWG.Done()
-		watchConfig(a.ctx, a.logger, a.configPath, a.reload, a.watchDirsCh)
 	}()
 
 	exitCode := 0
