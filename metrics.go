@@ -91,6 +91,20 @@ var (
 		[]string{"db"},
 	)
 
+	// dbConfigApplied — отдельный вопрос от dbUp: не "жива ли БД сейчас",
+	// а "то ли применено, что сейчас написано в конфиге". Может законно
+	// разойтись с dbUp во время graceful degradation (ротация пароля/хоста):
+	// старое соединение продолжает пинговаться (dbUp=1), но новый кандидат
+	// конфига не подключился (dbConfigApplied=0) — без отдельной метрики
+	// эту ситуацию видно только по логам, не по текущему состоянию.
+	dbConfigApplied = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "app_db_config_applied",
+			Help: "1 if the database's currently running connection matches its latest desired config, 0 if a newer config candidate failed to connect and the exporter fell back to (or remains without) a previous connection",
+		},
+		[]string{"db"},
+	)
+
 	// queryHealthSchemaConflict — 1 пока у запроса конфликт схемы лейблов
 	// (см. workerManager.reconcile). Отсутствие серии, а не 0 — так проще
 	// заметить на дашборде, не читая логи построчно. Ключ {query,db}, не
@@ -151,6 +165,7 @@ func init() {
 		configLastReloadTimestamp,
 		configLastSuccessTimestamp,
 		dbUp,
+		dbConfigApplied,
 		queryHealthSchemaConflict,
 		queryDuration,
 		dbPoolAcquired,

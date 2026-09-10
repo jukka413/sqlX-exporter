@@ -178,6 +178,7 @@ func (a *app) poolHealthChecker() {
 
 				a.logger.Info("db reconnected", "db", name)
 				a.pm.updateDBUpMetrics()
+				a.pm.updateDBConfigAppliedMetrics()
 
 				queries, queriesRev := a.wm.snapshotLastQueries()
 				if queriesRev != rev {
@@ -244,8 +245,9 @@ func (a *app) reload() {
 		return
 	}
 
-	if removed := sanitizeQueries(&newCfg); len(removed) > 0 {
-		for _, reason := range removed {
+	removedQueries := sanitizeQueries(&newCfg)
+	if len(removedQueries) > 0 {
+		for _, reason := range removedQueries {
 			a.logger.Error("skipping invalid query", "reason", reason)
 		}
 	}
@@ -281,14 +283,17 @@ func (a *app) reload() {
 	a.pm.closePools(toClose)
 	a.pm.deletePoolMetrics(removedDBs)
 
-	// success только если реально ВСЁ применилось; наличие failedIncludes
-	// означает что часть конфига (запросы/БД одного или нескольких файлов)
-	// не была применена — раньше это всё равно писалось как "success",
-	// хотя app_config_include_failures уже мог быть > 0. Pending-запросы и
-	// конфликты схемы — та же история: желаемый конфиг не применился
-	// целиком, хотя reload формально прошёл без критической ошибки.
+	// success только если реально ВСЁ применилось. failedIncludes/sanitized
+	// queries/pending queries/schema conflicts — часть конфига не была
+	// применена, хотя reload формально прошёл без критической ошибки.
+	// pendingDBs() проверяется отдельно от stats.Pending: последний считает
+	// только БД, на которые СЕЙЧАС ссылается хотя бы один запрос — БД,
+	// добавленная в конфиг заранее (ещё без запросов) и не подключившаяся,
+	// иначе никак не отразилась бы в result, хотя её app_db_up уже 0.
+	pendingDBCount := len(a.pm.pendingDBs())
 	result := "success"
-	if len(newCfg.failedIncludes) > 0 || stats.Pending > 0 || stats.SchemaConflicts > 0 {
+	if len(newCfg.failedIncludes) > 0 || stats.Pending > 0 || stats.SchemaConflicts > 0 ||
+		len(removedQueries) > 0 || pendingDBCount > 0 {
 		result = "partial_success"
 	}
 	configReloadTotal.WithLabelValues(result).Inc()
@@ -297,12 +302,14 @@ func (a *app) reload() {
 	a.logger.Info("reload complete",
 		"result", result,
 		"failed_includes", len(newCfg.failedIncludes),
+		"removed_queries", len(removedQueries),
 		"queries_started", stats.Started,
 		"queries_restarted", stats.Restarted,
 		"queries_stopped", stats.Stopped,
 		"queries_unchanged", stats.Unchanged,
 		"queries_pending", stats.Pending,
 		"queries_schema_conflicts", stats.SchemaConflicts,
+		"pending_dbs", pendingDBCount,
 	)
 }
 

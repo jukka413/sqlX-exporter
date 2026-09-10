@@ -163,12 +163,26 @@ func (pm *poolManager) applyConfig(revision uint64, dbs map[string]DBConfig) (to
 	}
 
 	pm.mu.Lock()
-	for name, p := range pm.pools {
-		if _, stillInCfg := dbs[name]; !stillInCfg {
-			removedDBs = append(removedDBs, name)
-			if p != nil && p.db != nil {
-				toClose[name] = p
-			}
+	// Union pools ∪ failedPools, не только pools — БД, которая ни разу не
+	// подключилась, существует только в failedPools. Проверка одного pools
+	// пропускала бы такую БД при удалении из конфига: removedDBs её не
+	// содержал бы, deletePoolMetrics никогда не вызывался бы для неё, и
+	// app_db_up{db=...}=0 (выставленный когда-то давно неудачным dial)
+	// оставался бы в реестре Prometheus навсегда.
+	seen := make(map[string]struct{}, len(pm.pools)+len(pm.failedPools))
+	for name := range pm.pools {
+		seen[name] = struct{}{}
+	}
+	for name := range pm.failedPools {
+		seen[name] = struct{}{}
+	}
+	for name := range seen {
+		if _, stillInCfg := dbs[name]; stillInCfg {
+			continue
+		}
+		removedDBs = append(removedDBs, name)
+		if p, ok := pm.pools[name]; ok && p != nil && p.db != nil {
+			toClose[name] = p
 		}
 	}
 	// newFailed уже полон: applyConfig проходит по ВСЕМ БД желаемого
@@ -179,6 +193,7 @@ func (pm *poolManager) applyConfig(revision uint64, dbs map[string]DBConfig) (to
 	pm.mu.Unlock()
 
 	pm.updateDBUpMetrics()
+	pm.updateDBConfigAppliedMetrics()
 
 	return toClose, removedDBs
 }
@@ -202,6 +217,21 @@ func (pm *poolManager) updateDBUpMetrics() {
 			continue
 		}
 		dbUp.WithLabelValues(name).Set(0)
+	}
+}
+
+// updateDBConfigAppliedMetrics публикует app_db_config_applied. В отличие
+// от updateDBUpMetrics, порядок здесь обратный: failed побеждает pools
+// безусловно — раз БД в failedPools, значит последний желаемый конфиг НЕ
+// применился, даже если старое соединение продолжает исправно работать.
+func (pm *poolManager) updateDBConfigAppliedMetrics() {
+	pools := pm.snapshotPools()
+	_, failed := pm.snapshotForReconnect()
+	for name := range pools {
+		dbConfigApplied.WithLabelValues(name).Set(1)
+	}
+	for name := range failed {
+		dbConfigApplied.WithLabelValues(name).Set(0)
 	}
 }
 
@@ -248,6 +278,8 @@ func (pm *poolManager) deletePoolMetrics(names []string) {
 		dbPoolIdle.DeleteLabelValues(name)
 		dbPoolTotal.DeleteLabelValues(name)
 		dbUp.DeleteLabelValues(name)
+		dbConfigApplied.DeleteLabelValues(name)
+		dbConnectionErrors.DeleteLabelValues(name)
 	}
 }
 
