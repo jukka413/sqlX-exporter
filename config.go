@@ -325,6 +325,17 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 					fmt.Sprintf("%q: no entry in include_defaults", includePath))
 				continue
 			}
+			if len(dbs) == 0 {
+				// Запись есть, но список БД пуст ("file.yaml: []") — цикл
+				// ниже не выполнится ни разу, и без этой явной проверки
+				// инклюд тихо пропадал бы, не попадая ни в skippedIncludes,
+				// ни в failedIncludes — то же самое молчаливое отключение,
+				// с которым мы уже боремся для "нет записи вообще", просто
+				// с другой причиной.
+				cfg.skippedIncludes = append(cfg.skippedIncludes,
+					fmt.Sprintf("%q: include_defaults entry is an empty list — no databases to apply this file to", includePath))
+				continue
+			}
 
 			addSuffix := len(dbs) > 1
 			for _, db := range dbs {
