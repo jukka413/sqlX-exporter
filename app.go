@@ -168,6 +168,27 @@ func (a *app) poolHealthChecker() {
 				// выше — сетевой I/O, специально вне лока.
 				a.stateMu.Lock()
 
+				// Проверяем ДО commitReconnect, не после — если инвариант
+				// (revision двух менеджеров синхронны под locked stateMu)
+				// всё же нарушится, откат должен ничего не оставлять
+				// изменённым. Раньше эта проверка шла после commitReconnect:
+				// при срабатывании пул уже был бы закоммичен, oldPool уже
+				// извлечён, но не закрыт (утечка соединения), а reconcile
+				// пропущен — воркеры остались бы на прежнем состоянии.
+				// Теперь при срабатывании вообще ничего не мутировано —
+				// только что продозвоненный db закрывается и выбрасывается.
+				queries, queriesRev := a.wm.snapshotLastQueries()
+				if queriesRev != rev {
+					invariantViolations.WithLabelValues("pool_worker_revision_mismatch").Inc()
+					a.logger.Error("worker state revision does not match pool revision before "+
+						"committing reconnect under stateMu — this should be impossible, discarding "+
+						"this reconnect attempt without mutating any state",
+						"db", name, "pool_revision", rev, "worker_revision", queriesRev)
+					a.stateMu.Unlock()
+					_ = db.Close()
+					continue
+				}
+
 				oldPool, ok := a.pm.commitReconnect(name, dbCfg, rev, db)
 				if !ok {
 					a.stateMu.Unlock()
@@ -180,18 +201,6 @@ func (a *app) poolHealthChecker() {
 				a.pm.updateDBUpMetrics()
 				a.pm.updateDBConfigAppliedMetrics()
 
-				queries, queriesRev := a.wm.snapshotLastQueries()
-				if queriesRev != rev {
-					// Под stateMu commitReconnect и reconcile всегда идут одним
-					// блоком — если revision тут разошлись, это не тайминг,
-					// а нарушение самого инварианта stateMu где-то ещё.
-					// Реконсилировать в таком состоянии небезопасно.
-					a.logger.Error("worker state revision does not match pool revision right after "+
-						"reconnect under stateMu — this should be impossible, skipping reconcile",
-						"db", name, "pool_revision", rev, "worker_revision", queriesRev)
-					a.stateMu.Unlock()
-					continue
-				}
 				stats := a.wm.reconcile(queriesRev, queries, a.pm.snapshotPools(), a.pm.pendingDBs(), a.getDefaultDB())
 				a.logger.Info("workers reconciled after reconnect", "db", name,
 					"queries_started", stats.Started, "queries_restarted", stats.Restarted)

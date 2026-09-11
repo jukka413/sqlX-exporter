@@ -294,6 +294,17 @@ func (pm *poolManager) deletePoolMetrics(names []string) {
 	}
 }
 
+// isCurrentPool сообщает, всё ещё ли checked — актуальный пул для этого
+// имени. Наблюдение (Ping, Stats), снятое со снэпшота в начале цикла,
+// могло устареть, если конкурентный reload/reconnect успел заменить пул,
+// пока наблюдение выполнялось — особенно актуально для PingContext,
+// реального сетевого запроса, который может занимать секунды.
+func (pm *poolManager) isCurrentPool(name string, checked *dbPool) bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.pools[name] == checked
+}
+
 func (pm *poolManager) metricsUpdater(period time.Duration) {
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
@@ -308,6 +319,12 @@ func (pm *poolManager) metricsUpdater(period time.Duration) {
 					continue
 				}
 				stat := p.db.Stats()
+				if !pm.isCurrentPool(name, p) {
+					// Пока читали Stats() (быстро, локально — окно узкое, но
+					// не нулевое), пул уже мог смениться. Следующий тик через
+					// period самокорректируется.
+					continue
+				}
 				dbPoolAcquired.WithLabelValues(name).Set(float64(stat.InUse))
 				dbPoolIdle.WithLabelValues(name).Set(float64(stat.Idle))
 				dbPoolTotal.WithLabelValues(name).Set(float64(stat.OpenConnections))
@@ -341,6 +358,15 @@ func (pm *poolManager) activeHealthCheck(period time.Duration) {
 				pingCtx, cancel := context.WithTimeout(pm.ctx, 5*time.Second)
 				err := p.db.PingContext(pingCtx)
 				cancel()
+
+				if !pm.isCurrentPool(name, p) {
+					// Пока пинговали (реальный сетевой запрос, до 5с) — пул
+					// уже заменили конкурентным reload/reconnect. Результат
+					// относится к пулу, которого больше нет — не публикуем
+					// его как текущее состояние; следующий цикл проверит
+					// актуальный пул.
+					continue
+				}
 				if err != nil {
 					pm.logger.Warn("active health check failed", "db", name, "error", err)
 					dbUp.WithLabelValues(name).Set(0)

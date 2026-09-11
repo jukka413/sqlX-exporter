@@ -49,6 +49,21 @@ var (
 		[]string{"db"},
 	)
 
+	// invariantViolations — должен оставаться на нуле всегда. Все остальные
+	// метрики ошибок в этом файле отражают нормальные операционные условия
+	// (БД недоступна, запрос упал, конфликт схемы) — это другое: сигнал, что
+	// нарушился внутренний инвариант, который по конструкции кода не должен
+	// быть нарушим (например revision двух менеджеров разошлись под locked
+	// stateMu). Ненулевое значение означает баг в самом экспортёре, не
+	// проблему со средой/конфигом/БД — стоит алертить отдельно и жёстче.
+	invariantViolations = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "app_internal_invariant_violations_total",
+			Help: "Count of internal invariant violations detected at runtime — should always stay at zero; any nonzero value indicates a bug in the exporter itself, not an operational issue",
+		},
+		[]string{"invariant"},
+	)
+
 	// configIncludeFailures — сколько инклюдов не удалось загрузить при
 	// последнем reload. Такая ошибка не блокирует остальной конфиг, поэтому
 	// не видна из самого факта "reload complete" — эта метрика даёт то,
@@ -166,6 +181,7 @@ func init() {
 		queryUp,
 		queryLastSuccess,
 		dbConnectionErrors,
+		invariantViolations,
 		configIncludeFailures,
 		configReloadTotal,
 		configLastReloadTimestamp,

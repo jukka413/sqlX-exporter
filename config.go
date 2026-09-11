@@ -652,6 +652,11 @@ func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
 	if !isValidPrometheusName(metricName) {
 		return fmt.Sprintf("metric name %q is not a valid Prometheus metric name", metricName)
 	}
+	if reserved := reservedMetricPrefix(metricName); reserved != "" {
+		return fmt.Sprintf("metric name %q uses the reserved prefix %q — reserved for the exporter's "+
+			"own internal metrics (app_) or Prometheus/Go runtime collectors (process_, go_, scrape_), "+
+			"pick a different name to avoid colliding with an existing metric", metricName, reserved)
+	}
 	for label := range q.Labels {
 		if label == "db" || label == "env" {
 			return fmt.Sprintf("static label %q is reserved (always set automatically) and cannot be overridden", label)
@@ -671,13 +676,17 @@ func validateSingleQuery(cfg *Config, name string, q QueryConfig) string {
 	return ""
 }
 
-// isValidPrometheusName: [a-zA-Z_:][a-zA-Z0-9_:]*
+// isValidPrometheusName: [a-zA-Z_][a-zA-Z0-9_]*. Без ":" — формально
+// Prometheus его допускает в именах метрик, но резервирует за recording
+// rules и рекомендует экспортёрам не использовать; это только соглашение,
+// нарушение которого ничего не ломает функционально, в отличие от
+// reservedMetricPrefix ниже.
 func isValidPrometheusName(name string) bool {
 	if name == "" {
 		return false
 	}
 	for i, r := range name {
-		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || r == ':'
+		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_'
 		isDigit := r >= '0' && r <= '9'
 		if i == 0 {
 			if !isLetter {
@@ -690,6 +699,26 @@ func isValidPrometheusName(name string) bool {
 		}
 	}
 	return true
+}
+
+// reservedMetricPrefix возвращает непустой префикс, если metricName в него
+// попадает — иначе "". В отличие от isValidPrometheusName (синтаксис),
+// это про конкретный, функциональный риск: "app_" — метрики самого
+// экспортёра (app_query_up и т.д.), "process_"/"go_" — встроенные
+// коллекторы client_golang (ProcessCollector/GoCollector), "scrape_" —
+// добавляется самим Prometheus-сервером при скрейпе любой цели. Запрос
+// пользователя с таким именем либо получит явную ошибку регистрации
+// (если лейблы не совпали с уже существующим коллектором), либо —
+// что хуже — "усыновит" чужой коллектор через AlreadyRegisteredError и
+// начнёт молча писать значения SQL-запроса в наш собственный внутренний
+// сигнал здоровья.
+func reservedMetricPrefix(metricName string) string {
+	for _, prefix := range []string{"app_", "process_", "go_", "scrape_"} {
+		if strings.HasPrefix(metricName, prefix) {
+			return prefix
+		}
+	}
+	return ""
 }
 
 // isValidPrometheusLabelName: [a-zA-Z_][a-zA-Z0-9_]*, без "__" в начале.
