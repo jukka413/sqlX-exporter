@@ -17,10 +17,25 @@ import (
 // unmarshalYAMLStrict парсит YAML с KnownFields(true) — опечатка в имени
 // поля становится явной ошибкой, а не молча отброшенным значением.
 // io.EOF от Decode() (пустой/закомментированный файл) не считается ошибкой.
+//
+// Multi-document YAML (несколько документов через "---" в одном файле,
+// привычный синтаксис из Kubernetes-манифестов) явно не поддерживается —
+// без этой проверки Decode() читает только первый документ, а всё после
+// "---" молча теряется без единой ошибки: reload отчитается success,
+// хотя часть файла даже не была прочитана.
 func unmarshalYAMLStrict(data []byte, out any) error {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(out); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("file contains more than one YAML document (separated by \"---\") — " +
+				"multi-document files are not supported, only the first document would be used")
+		}
 		return err
 	}
 	return nil
@@ -180,7 +195,7 @@ func loadConfig(path string) (Config, error) {
 	}
 	rootDir := filepath.Dir(absPath)
 
-	cfg, err := loadConfigWithContext(path, 0, "", nil, rootDir)
+	cfg, err := loadConfigWithContext(path, 0, "", nil, rootDir, false)
 	if err != nil {
 		return cfg, err
 	}
@@ -244,7 +259,10 @@ const maxIncludeDepth = 10
 // loadConfigWithContext загружает один файл конфига и рекурсивно — его
 // инклюды. rootDir — директория корневого конфига; все инклюды обязаны
 // резолвиться внутри неё (защита от path traversal через "../..").
-func loadConfigWithContext(path string, depth int, parentDefaultDB string, parentIncludeDefaults map[string]IncludeDefault, rootDir string) (Config, error) {
+// rejectExplicitDB — true когда этот файл обрабатывается в рамках
+// multi-DB include_defaults (один файл на несколько БД сразу): в этом
+// режиме запросы не имеют права задавать db: явно (см. проверку ниже).
+func loadConfigWithContext(path string, depth int, parentDefaultDB string, parentIncludeDefaults map[string]IncludeDefault, rootDir string, rejectExplicitDB bool) (Config, error) {
 	var cfg Config
 
 	if depth > maxIncludeDepth {
@@ -271,6 +289,22 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 		if q.MetricName == "" {
 			q.MetricName = name
 			cfg.Queries[name] = q
+		}
+	}
+
+	// Проверяем ДО applyDefaultDB ниже — только тут ещё можно отличить
+	// "пользователь сам написал db: в YAML" от "db: сейчас подставит
+	// include_defaults". После applyDefaultDB оба случая неотличимы —
+	// оба дают непустой q.DB, и проверка постфактум (как было раньше)
+	// ложно срабатывала бы на КАЖДЫЙ запрос, которому include_defaults
+	// только что законно проставил db:, а не на реально написанный вручную.
+	if rejectExplicitDB {
+		for name, q := range cfg.Queries {
+			if q.DB != "" {
+				return cfg, fmt.Errorf("query %q has an explicit db %q, but this include is used for "+
+					"multiple databases via include_defaults — explicit db: is not allowed here, it would "+
+					"run the same query against the same database multiple times", name, q.DB)
+			}
 		}
 	}
 
@@ -351,7 +385,13 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 
 			addSuffix := len(dbs) > 1
 			for _, db := range dbs {
-				inc, err := loadConfigWithContext(fullPath, depth+1, db, effectiveIncludeDefaults, rootDir)
+				// rejectExplicitDB || addSuffix — прилипает: если этот файл сам
+				// обрабатывается под внешним multi-DB (rejectExplicitDB=true),
+				// это ограничение должно распространяться и на его собственные
+				// вложенные инклюды, а не только на его прямые queries — иначе
+				// явный db: там ускользнул бы от проверки, а потом всё равно
+				// попал бы под клонирование на внешнем уровне.
+				inc, err := loadConfigWithContext(fullPath, depth+1, db, effectiveIncludeDefaults, rootDir, rejectExplicitDB || addSuffix)
 				if err != nil {
 					// Один сломанный инклюд не должен блокировать остальные —
 					// его databases/queries просто отсутствуют в итоге.
@@ -407,13 +447,37 @@ func applyDefaultDB(cfg *Config, defaultDB string) {
 // URL, драйвер берёт пароль как есть — см. go-sql-driver/mysql docs), TNS-
 // дескрипторы Oracle не кодируются (иначе ломается их грамматика), остальное
 // — через escapeURLComponent.
+// expandBracedOnly заменяет только строгий синтаксис ${VAR_NAME} — в
+// отличие от os.Expand, НЕ трогает голый $VAR без фигурных скобок.
+// os.Expand обрабатывает оба варианта; это опасно для литерального,
+// зашитого в YAML пароля вроде "MyP@ss$word123" — голый "$word123" был
+// бы воспринят как ссылка на переменную окружения "word123", и, не найдя
+// такую, тихо заменён пустой строкой, испортив пароль ещё до попытки
+// подключения. Символ "$" сам по себе (не начинающий "${") копируется
+// в результат как есть.
+func expandBracedOnly(s string, mapping func(string) string) string {
+	var sb strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == '$' && i+1 < len(s) && s[i+1] == '{' {
+			if end := strings.IndexByte(s[i+2:], '}'); end != -1 {
+				sb.WriteString(mapping(s[i+2 : i+2+end]))
+				i += 2 + end + 1
+				continue
+			}
+		}
+		sb.WriteByte(s[i])
+		i++
+	}
+	return sb.String()
+}
+
 func expandURLs(cfg *Config) (missingVars []string) {
 	seen := make(map[string]struct{})
 
 	for name, db := range cfg.Databases {
 		isMySQL := strings.EqualFold(strings.TrimSpace(db.Driver), "mysql")
 
-		db.URL = os.Expand(db.URL, func(key string) string {
+		db.URL = expandBracedOnly(db.URL, func(key string) string {
 			val, ok := os.LookupEnv(key)
 			if !ok {
 				warning := fmt.Sprintf("database %q: ${%s} is not set in environment", name, key)

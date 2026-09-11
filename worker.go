@@ -157,6 +157,15 @@ func runOnce(
 		queryUp.WithLabelValues(metricName, queryCfg.DB).Set(0)
 		logger.Error("query failed", "query", metricName, "db", queryCfg.DB, "reason", reason, "error", runErr)
 
+		// app_query_schema_conflict — тот же гейдж, что уже используется для
+		// config-level конфликта (см. workerManager.reconcile), теперь ещё и
+		// для runtime-обнаруженного. Только для schema_mismatch — при других
+		// reason мы не добрались до проверки схемы вообще, и ничего нового
+		// про неё не знаем, поэтому гейдж не трогаем ни в какую сторону.
+		if reason == "schema_mismatch" {
+			queryHealthSchemaConflict.WithLabelValues(metricName, queryCfg.DB).Set(1)
+		}
+
 		if metric, exists := lookupQueryMetric(metricName); exists {
 			for _, lbl := range prevLabels {
 				metric.Delete(lbl)
@@ -167,6 +176,7 @@ func runOnce(
 
 	queryUp.WithLabelValues(metricName, queryCfg.DB).Set(1)
 	queryLastSuccess.WithLabelValues(metricName, queryCfg.DB).SetToCurrentTime()
+	queryHealthSchemaConflict.DeleteLabelValues(metricName, queryCfg.DB)
 	logger.Info("query success", "query", metricName, "db", queryCfg.DB, "duration", duration)
 
 	return nextPrevLabels
@@ -225,6 +235,12 @@ func runSingleValue(
 
 	metric, err := getOrCreateQueryMetric(name, queryCfg.Labels, nil)
 	if err != nil {
+		// Та же чистка, что и в двух путях выше — не оставляем старое
+		// значение зависшим только потому что подвела именно эта проверка,
+		// а не Scan()/toFloat64().
+		if existing, exists := lookupQueryMetric(name); exists {
+			existing.Delete(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil))
+		}
 		return err
 	}
 	// GetMetricWith, не With: With паникует при несовпадении лейблов со
@@ -232,6 +248,7 @@ func runSingleValue(
 	// существующий, зафиксированный ранее коллектор).
 	gauge, err := metric.GetMetricWith(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil))
 	if err != nil {
+		metric.Delete(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil))
 		return fmt.Errorf("metric %q: %w: %w", name, errSchemaMismatch, err)
 	}
 	gauge.Set(value)
