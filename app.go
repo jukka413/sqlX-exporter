@@ -242,6 +242,9 @@ func (a *app) reload() {
 	for _, reason := range newCfg.overwritten {
 		a.logger.Warn("config key overwritten by a later include", "detail", reason)
 	}
+	for _, reason := range newCfg.ignoredSettings {
+		a.logger.Warn("settings: is only honored in the root config", "detail", reason)
+	}
 	for _, reason := range newCfg.failedIncludes {
 		a.logger.Error("include failed to load — the rest of the config was still applied normally",
 			"detail", reason)

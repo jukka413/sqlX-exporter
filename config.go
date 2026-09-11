@@ -65,6 +65,7 @@ type Config struct {
 	missingEnvVars  []string `yaml:"-"` // ${VAR} не найдена в окружении
 	overwritten     []string `yaml:"-"` // database/query перезаписаны другим инклюдом
 	failedIncludes  []string `yaml:"-"` // инклюд не удалось загрузить
+	ignoredSettings []string `yaml:"-"` // settings: вне root config — проигнорирован
 	dependencies    []string `yaml:"-"` // абсолютные пути всех прочитанных файлов
 }
 
@@ -138,6 +139,22 @@ type DBConfig struct {
 
 	MaxConnLifetime string `yaml:"max_conn_lifetime,omitempty"`
 	MaxConnIdleTime string `yaml:"max_conn_idle_time,omitempty"`
+}
+
+// sameDBConfig сравнивает DBConfig по значению — прямое a != b сравнивало бы
+// MaxConns/MaxIdleConns по адресу указателя, не по числу: две независимые
+// YAML-декодировки одного и того же "max_conns: 10" дают РАЗНЫЕ *int,
+// указывающие на разные аллокации с одинаковым числом внутри. intPtrEqual
+// определена в pool_manager.go (тот же пакет, отдельный импорт не нужен) —
+// тот же helper, что уже используется в needUpdate при коммите пула.
+func sameDBConfig(a, b DBConfig) bool {
+	return a.Driver == b.Driver &&
+		a.URL == b.URL &&
+		a.Env == b.Env &&
+		intPtrEqual(a.MaxConns, b.MaxConns) &&
+		intPtrEqual(a.MaxIdleConns, b.MaxIdleConns) &&
+		a.MaxConnLifetime == b.MaxConnLifetime &&
+		a.MaxConnIdleTime == b.MaxConnIdleTime
 }
 
 type QueryConfig struct {
@@ -292,6 +309,23 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 		}
 	}
 
+	// settings: разрешён только в корневом конфиге. Раньше settings любого
+	// инклюда безусловно перезаписывал общий, единственный на весь процесс
+	// AppSettings — файл одной команды мог незаметно поменять, например,
+	// max_conns по умолчанию для баз совершенно другой команды в другом
+	// файле, и это нигде не логировалось (в отличие от databases:/queries:,
+	// у которых для этого уже был overwritten). Обнуляем здесь и явно
+	// фиксируем в ignoredSettings — дальше это settings уже не попадёт в
+	// mergeConfig (там смотрит на src.Settings.* конкретно этого файла).
+	if depth > 0 {
+		var zero AppSettings
+		if cfg.Settings != zero {
+			cfg.ignoredSettings = append(cfg.ignoredSettings,
+				fmt.Sprintf("%q: settings: is only honored in the root config, ignored here", path))
+			cfg.Settings = zero
+		}
+	}
+
 	// Проверяем ДО applyDefaultDB ниже — только тут ещё можно отличить
 	// "пользователь сам написал db: в YAML" от "db: сейчас подставит
 	// include_defaults". После applyDefaultDB оба случая неотличимы —
@@ -407,6 +441,7 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 				cfg.missingEnvVars = append(cfg.missingEnvVars, inc.missingEnvVars...)
 				cfg.overwritten = append(cfg.overwritten, inc.overwritten...)
 				cfg.failedIncludes = append(cfg.failedIncludes, inc.failedIncludes...)
+				cfg.ignoredSettings = append(cfg.ignoredSettings, inc.ignoredSettings...)
 				cfg.dependencies = append(cfg.dependencies, inc.dependencies...)
 			}
 		}
@@ -544,34 +579,17 @@ func cloneQueriesForDB(cfg Config, db string) Config {
 
 // mergeConfig мержит src в dst; src (инклюд sourceLabel) побеждает при
 // коллизии ключей. Коллизия с ДРУГИМ значением логируется в dst.overwritten.
+//
+// settings: сюда не входит — loadConfigWithContext обнуляет Settings любого
+// файла с depth > 0 ещё до того как он сюда попадёт (см. ignoredSettings),
+// так что src.Settings у инклюда всегда пуст. dst.Settings — это всегда
+// именно то, что явно написано в root config, без дальнейшего мержа.
 func mergeConfig(dst *Config, src Config, sourceLabel string) {
-	if src.Settings.DBReconnectInterval != "" {
-		dst.Settings.DBReconnectInterval = src.Settings.DBReconnectInterval
-	}
-	if src.Settings.DefaultDB != "" {
-		dst.Settings.DefaultDB = src.Settings.DefaultDB
-	}
-	if src.Settings.DefaultTimezone != "" {
-		dst.Settings.DefaultTimezone = src.Settings.DefaultTimezone
-	}
-	if src.Settings.DefaultMaxConns != nil {
-		dst.Settings.DefaultMaxConns = src.Settings.DefaultMaxConns
-	}
-	if src.Settings.DefaultMaxIdleConns != nil {
-		dst.Settings.DefaultMaxIdleConns = src.Settings.DefaultMaxIdleConns
-	}
-	if src.Settings.DefaultMaxConnLifetime != "" {
-		dst.Settings.DefaultMaxConnLifetime = src.Settings.DefaultMaxConnLifetime
-	}
-	if src.Settings.DefaultMaxConnIdleTime != "" {
-		dst.Settings.DefaultMaxConnIdleTime = src.Settings.DefaultMaxConnIdleTime
-	}
-
 	if dst.Databases == nil {
 		dst.Databases = make(map[string]DBConfig)
 	}
 	for name, db := range src.Databases {
-		if existing, exists := dst.Databases[name]; exists && existing != db {
+		if existing, exists := dst.Databases[name]; exists && !sameDBConfig(existing, db) {
 			dst.overwritten = append(dst.overwritten,
 				fmt.Sprintf("database %q overwritten by include %q", name, sourceLabel))
 		}

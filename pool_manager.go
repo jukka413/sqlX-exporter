@@ -259,7 +259,7 @@ func (pm *poolManager) commitReconnect(name string, dbCfg DBConfig, expectedRevi
 		return nil, false
 	}
 	current, stillFailed := pm.failedPools[name]
-	if !stillFailed || current != dbCfg {
+	if !stillFailed || !sameDBConfig(current, dbCfg) {
 		return nil, false
 	}
 
