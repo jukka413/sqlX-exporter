@@ -17,12 +17,8 @@ import (
 // unmarshalYAMLStrict парсит YAML с KnownFields(true) — опечатка в имени
 // поля становится явной ошибкой, а не молча отброшенным значением.
 // io.EOF от Decode() (пустой/закомментированный файл) не считается ошибкой.
-//
-// Multi-document YAML (несколько документов через "---" в одном файле,
-// привычный синтаксис из Kubernetes-манифестов) явно не поддерживается —
-// без этой проверки Decode() читает только первый документ, а всё после
-// "---" молча теряется без единой ошибки: reload отчитается success,
-// хотя часть файла даже не была прочитана.
+// Второй Decode() отклоняет multi-document YAML ("---" в одном файле) —
+// иначе всё после первого документа молча терялось бы.
 func unmarshalYAMLStrict(data []byte, out any) error {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -93,24 +89,17 @@ type AppSettings struct {
 	DBReconnectInterval string `yaml:"db_reconnect_interval,omitempty"`
 	DefaultDB           string `yaml:"default_db,omitempty"`
 
-	// Дефолты пула для databases: — применяются в applyDefaultPoolSettings,
-	// когда БД не задаёт поле явно. Имена ключей совпадают с полями
-	// DBConfig намеренно, для интуитивного переопределения.
-	//
-	// *int, не int — иначе нельзя было бы отличить "явно 0" от "не задано":
-	// у Go нулевое значение int — тоже 0, и database/sql трактует
-	// max_idle_conns=0 как значащее ("не держать простаивающие соединения",
-	// а не дефолтные 2) — явный ноль на уровне конкретной БД должен уметь
-	// переопределить ненулевой глобальный дефолт, а не потеряться в нём.
+	// Дефолты пула для databases: без явного значения (см. applyDefaultPoolSettings).
+	// *int, не int — иначе нельзя отличить "явно 0" от "не задано": Go
+	// зануляет неустановленный int тоже в 0, а database/sql трактует
+	// max_idle_conns=0 как значащее ("не держать простаивающие соединения").
 	DefaultMaxConns        *int   `yaml:"max_conns,omitempty"`
 	DefaultMaxIdleConns    *int   `yaml:"max_idle_conns,omitempty"`
 	DefaultMaxConnLifetime string `yaml:"max_conn_lifetime,omitempty"`
 	DefaultMaxConnIdleTime string `yaml:"max_conn_idle_time,omitempty"`
 
-	// DefaultTimezone — таймзона по умолчанию для запросов с schedule:,
-	// у которых нет своего schedule.timezone. Применяется в
-	// applyDefaultTimezone. Если не задано ни здесь, ни в самом запросе —
-	// используется UTC (см. parseSchedule).
+	// DefaultTimezone — дефолт для schedule.timezone запросов без своего
+	// значения (applyDefaultTimezone). Если не задано нигде — UTC.
 	DefaultTimezone string `yaml:"default_timezone,omitempty"`
 }
 
@@ -142,11 +131,8 @@ type DBConfig struct {
 }
 
 // sameDBConfig сравнивает DBConfig по значению — прямое a != b сравнивало бы
-// MaxConns/MaxIdleConns по адресу указателя, не по числу: две независимые
-// YAML-декодировки одного и того же "max_conns: 10" дают РАЗНЫЕ *int,
-// указывающие на разные аллокации с одинаковым числом внутри. intPtrEqual
-// определена в pool_manager.go (тот же пакет, отдельный импорт не нужен) —
-// тот же helper, что уже используется в needUpdate при коммите пула.
+// MaxConns/MaxIdleConns по адресу указателя: две независимые YAML-декодировки
+// одного "max_conns: 10" дают разные *int на одинаковое число внутри.
 func sameDBConfig(a, b DBConfig) bool {
 	return a.Driver == b.Driver &&
 		a.URL == b.URL &&
@@ -193,18 +179,9 @@ type ScheduleAt struct {
 }
 
 // loadConfig загружает конфиг из path и рекурсивно обрабатывает includes.
-//
-// Корневой файл читается ровно один раз, внутри loadConfigWithContext на
-// depth==0 — раньше здесь был отдельный "preview"-проход, читающий тот же
-// файл ещё раз только чтобы заранее вытащить default_db/include_defaults.
-// Два раздельных os.ReadFile одного и того же файла не атомарны друг
-// относительно друга: если содержимое на диске поменяется между ними
-// (например Kubernetes переключил ..data ровно в этот момент), итоговый
-// cfg мог оказаться собран из ДВУХ разных версий файла одновременно —
-// в частности mergeIncludeDefaults(base, override) только перезаписывает
-// совпадающие ключи, а не заменяет карту целиком, поэтому ключ, удалённый
-// в новой версии, мог "воскреснуть" из значения preview-прохода, снятого
-// со старой.
+// Корневой файл читается ровно один раз (внутри loadConfigWithContext на
+// depth==0) — два раздельных чтения одного файла не были бы атомарны друг
+// относительно друга, если содержимое на диске поменяется между ними.
 func loadConfig(path string) (Config, error) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
@@ -309,14 +286,9 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 		}
 	}
 
-	// settings: разрешён только в корневом конфиге. Раньше settings любого
-	// инклюда безусловно перезаписывал общий, единственный на весь процесс
-	// AppSettings — файл одной команды мог незаметно поменять, например,
-	// max_conns по умолчанию для баз совершенно другой команды в другом
-	// файле, и это нигде не логировалось (в отличие от databases:/queries:,
-	// у которых для этого уже был overwritten). Обнуляем здесь и явно
-	// фиксируем в ignoredSettings — дальше это settings уже не попадёт в
-	// mergeConfig (там смотрит на src.Settings.* конкретно этого файла).
+	// settings: разрешён только в корневом конфиге — один общий процесс-
+	// уровневый набор значений, не то, что мержится по частям из разных
+	// файлов. Обнуляем и фиксируем в ignoredSettings, а не молчим.
 	if depth > 0 {
 		var zero AppSettings
 		if cfg.Settings != zero {
@@ -326,12 +298,9 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 		}
 	}
 
-	// Проверяем ДО applyDefaultDB ниже — только тут ещё можно отличить
-	// "пользователь сам написал db: в YAML" от "db: сейчас подставит
-	// include_defaults". После applyDefaultDB оба случая неотличимы —
-	// оба дают непустой q.DB, и проверка постфактум (как было раньше)
-	// ложно срабатывала бы на КАЖДЫЙ запрос, которому include_defaults
-	// только что законно проставил db:, а не на реально написанный вручную.
+	// Проверяем ДО applyDefaultDB ниже — иначе не отличить "пользователь сам
+	// написал db:" от "db: сейчас подставит include_defaults" (оба дают
+	// непустой q.DB после applyDefaultDB).
 	if rejectExplicitDB {
 		for name, q := range cfg.Queries {
 			if q.DB != "" {
@@ -342,13 +311,8 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 		}
 	}
 
-	// settings.default_db как фолбэк — только для корневого файла (depth==0).
-	// Раньше это вычислялось в loadConfig() из отдельного preview-чтения;
-	// теперь берётся из этого же, единственного чтения cfg. Ограничение по
-	// depth сохраняет прежнюю семантику: settings.default_db инклюда сам по
-	// себе не становится "родительским" фолбэком для остальных файлов —
-	// таким фолбэком был (и остаётся) только default_db/settings.default_db
-	// корневого конфига.
+	// settings.default_db — фолбэк только для корневого файла (depth==0);
+	// инклюд сам по себе не становится "родительским" фолбэком для других.
 	effectiveDefaultDB := cfg.DefaultDB
 	if depth == 0 && effectiveDefaultDB == "" {
 		effectiveDefaultDB = cfg.Settings.DefaultDB
@@ -419,12 +383,8 @@ func loadConfigWithContext(path string, depth int, parentDefaultDB string, paren
 
 			addSuffix := len(dbs) > 1
 			for _, db := range dbs {
-				// rejectExplicitDB || addSuffix — прилипает: если этот файл сам
-				// обрабатывается под внешним multi-DB (rejectExplicitDB=true),
-				// это ограничение должно распространяться и на его собственные
-				// вложенные инклюды, а не только на его прямые queries — иначе
-				// явный db: там ускользнул бы от проверки, а потом всё равно
-				// попал бы под клонирование на внешнем уровне.
+				// rejectExplicitDB || addSuffix — прилипает к вложенным инклюдам,
+				// не только к прямым queries этого файла.
 				inc, err := loadConfigWithContext(fullPath, depth+1, db, effectiveIncludeDefaults, rootDir, rejectExplicitDB || addSuffix)
 				if err != nil {
 					// Один сломанный инклюд не должен блокировать остальные —
@@ -579,11 +539,9 @@ func cloneQueriesForDB(cfg Config, db string) Config {
 
 // mergeConfig мержит src в dst; src (инклюд sourceLabel) побеждает при
 // коллизии ключей. Коллизия с ДРУГИМ значением логируется в dst.overwritten.
-//
-// settings: сюда не входит — loadConfigWithContext обнуляет Settings любого
-// файла с depth > 0 ещё до того как он сюда попадёт (см. ignoredSettings),
-// так что src.Settings у инклюда всегда пуст. dst.Settings — это всегда
-// именно то, что явно написано в root config, без дальнейшего мержа.
+// settings: сюда не входит — оно уже обнулено для любого файла с depth > 0
+// (см. ignoredSettings в loadConfigWithContext), так что src.Settings всегда
+// пуст.
 func mergeConfig(dst *Config, src Config, sourceLabel string) {
 	if dst.Databases == nil {
 		dst.Databases = make(map[string]DBConfig)
@@ -720,16 +678,11 @@ func isValidPrometheusName(name string) bool {
 }
 
 // reservedMetricPrefix возвращает непустой префикс, если metricName в него
-// попадает — иначе "". В отличие от isValidPrometheusName (синтаксис),
-// это про конкретный, функциональный риск: "app_" — метрики самого
-// экспортёра (app_query_up и т.д.), "process_"/"go_" — встроенные
-// коллекторы client_golang (ProcessCollector/GoCollector), "scrape_" —
-// добавляется самим Prometheus-сервером при скрейпе любой цели. Запрос
-// пользователя с таким именем либо получит явную ошибку регистрации
-// (если лейблы не совпали с уже существующим коллектором), либо —
-// что хуже — "усыновит" чужой коллектор через AlreadyRegisteredError и
-// начнёт молча писать значения SQL-запроса в наш собственный внутренний
-// сигнал здоровья.
+// попадает — иначе "". "app_" — метрики самого экспортёра, "process_"/"go_" —
+// встроенные коллекторы client_golang, "scrape_" — добавляется самим
+// Prometheus-сервером при скрейпе. Столкновение с ними — либо явная ошибка
+// регистрации, либо, что хуже, тихое "усыновление" чужого коллектора через
+// AlreadyRegisteredError и запись значений SQL-запроса в наш же health-сигнал.
 func reservedMetricPrefix(metricName string) string {
 	for _, prefix := range []string{"app_", "process_", "go_", "scrape_"} {
 		if strings.HasPrefix(metricName, prefix) {

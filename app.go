@@ -42,22 +42,17 @@ type app struct {
 	// реконсиляцию воркеров — как один неделимый блок, для обоих путей
 	// применения конфига (reload и reconnect). Без него между коммитом
 	// poolManager и вызовом workerManager.reconcile есть зазор в несколько
-	// инструкций, в который может втиснуться конкурентный commitReconnect:
-	// он увидит уже обновлённый pm.revision, но ещё не обновлённый
-	// wm.lastQueriesRevision, и реконсилирует новые пулы со старыми
-	// desired-запросами. Stale-revision guard внутри workerManager.reconcile
-	// этот конкретный случай не ловит — там revision формально не "старее"
-	// уже применённой, она просто отстаёт от pm на долю секунды.
+	// инструкций, в который мог бы втиснуться конкурентный commitReconnect
+	// с уже новым pm.revision, но ещё старым wm.lastQueriesRevision.
+	// Stale-revision guard в workerManager.reconcile этот случай не ловит —
+	// там revision не "старее" уже применённой, она просто отстаёт на
+	// доли секунды.
 	//
-	// dial() (сетевой I/O) остаётся вне stateMu только в пути reconnect
-	// (poolHealthChecker дозванивается ДО захвата лока). В пути reload
-	// это не так: pm.applyConfig() сам вызывает dial() для изменившихся
-	// БД, а reload() держит stateMu на весь applyConfig целиком — значит
-	// на время reload'а с несколькими изменёнными БД лок удерживается и
-	// во время сетевого I/O тоже. Осознанная цена простоты первой версии
-	// (см. комментарий внутри reload()); если это станет узким местом,
-	// applyConfig можно будет разделить на prepare (dial, вне stateMu) и
-	// commit (мутация карт, под stateMu).
+	// dial() (сетевой I/O) вне stateMu только в пути reconnect — в пути
+	// reload держится на весь applyConfig целиком, включая дозвон для
+	// изменившихся БД. Осознанная цена простоты; если станет узким местом,
+	// applyConfig можно разделить на prepare (dial, вне stateMu) и commit
+	// (мутация карт, под stateMu).
 	stateMu sync.Mutex
 
 	// revision — счётчик применённой конфигурации, растёт на 1 в начале
@@ -168,15 +163,10 @@ func (a *app) poolHealthChecker() {
 				// выше — сетевой I/O, специально вне лока.
 				a.stateMu.Lock()
 
-				// Проверяем ДО commitReconnect, не после — если инвариант
-				// (revision двух менеджеров синхронны под locked stateMu)
-				// всё же нарушится, откат должен ничего не оставлять
-				// изменённым. Раньше эта проверка шла после commitReconnect:
-				// при срабатывании пул уже был бы закоммичен, oldPool уже
-				// извлечён, но не закрыт (утечка соединения), а reconcile
-				// пропущен — воркеры остались бы на прежнем состоянии.
-				// Теперь при срабатывании вообще ничего не мутировано —
-				// только что продозвоненный db закрывается и выбрасывается.
+				// Проверяем ДО commitReconnect — если инвариант (revision
+				// синхронны под locked stateMu) всё же нарушится, откат не
+				// должен оставлять ничего изменённым: пул ещё не закоммичен,
+				// только что продозвоненный db просто закрывается.
 				queries, queriesRev := a.wm.snapshotLastQueries()
 				if queriesRev != rev {
 					invariantViolations.WithLabelValues("pool_worker_revision_mismatch").Inc()
@@ -295,13 +285,10 @@ func (a *app) reload() {
 	a.pm.closePools(toClose)
 	a.pm.deletePoolMetrics(removedDBs)
 
-	// success только если реально ВСЁ применилось. failedIncludes/sanitized
-	// queries/pending queries/schema conflicts — часть конфига не была
-	// применена, хотя reload формально прошёл без критической ошибки.
-	// pendingDBs() проверяется отдельно от stats.Pending: последний считает
-	// только БД, на которые СЕЙЧАС ссылается хотя бы один запрос — БД,
-	// добавленная в конфиг заранее (ещё без запросов) и не подключившаяся,
-	// иначе никак не отразилась бы в result, хотя её app_db_up уже 0.
+	// success только если реально ВСЁ применилось. pendingDBs() проверяется
+	// отдельно от stats.Pending — последний считает только БД, на которые
+	// СЕЙЧАС ссылается хотя бы один запрос; БД без единого запроса иначе не
+	// отразилась бы в result, хотя её app_db_up уже 0.
 	pendingDBCount := len(a.pm.pendingDBs())
 	result := "success"
 	if len(newCfg.failedIncludes) > 0 || stats.Pending > 0 || stats.SchemaConflicts > 0 ||

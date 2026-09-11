@@ -34,11 +34,8 @@ func openAndPingDB(ctx context.Context, cfg DBConfig, logger *slog.Logger) (*sql
 		db.SetMaxOpenConns(*cfg.MaxConns)
 	}
 	if cfg.MaxIdleConns != nil {
-		// Именно nil-проверка, не ">0" — 0 здесь теперь значащее явное
-		// значение ("не держать простаивающие соединения"), а не "не задано".
-		// SetMaxIdleConns(0) — осмысленный вызов сам по себе, в отличие от
-		// SetMaxOpenConns(0), который для database/sql и так означает
-		// "без ограничений" что бы мы ни передали.
+		// nil-проверка, не ">0" — 0 значащее ("не держать простаивающие
+		// соединения"), не "не задано".
 		db.SetMaxIdleConns(*cfg.MaxIdleConns)
 	}
 	if cfg.MaxConnLifetime != "" {

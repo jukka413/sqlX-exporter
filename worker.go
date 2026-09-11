@@ -81,13 +81,9 @@ func startQueryWorker(
 			logger.Info("stopping query worker", "query", metricName, "db", queryCfg.DB)
 			return
 		case <-ticker.C:
-			// Выполняем синхронно, в этой же горутине — пока runOnce занят,
-			// select ничего не читает из ticker.C, и Go сам отбрасывает
-			// пропущенные тики (не копит их в очередь). Это даёт
-			// "пропустить, если предыдущий ещё выполняется" бесплатно: если
-			// query занимает дольше interval, следующие срабатывания тикера
-			// просто не встают в очередь, а не запускают наложенное
-			// выполнение поверх текущего.
+			// Синхронно, в этой же горутине — пока runOnce занят, select не
+			// читает ticker.C, и Go сам отбрасывает пропущенные тики. Даёт
+			// "пропустить, если предыдущий ещё выполняется" бесплатно.
 			runIntervalTick(ctx, logger, name, metricName, queryCfg, db, timeout, interval, prevLabels)
 		}
 	}
@@ -235,9 +231,6 @@ func runSingleValue(
 
 	metric, err := getOrCreateQueryMetric(name, queryCfg.Labels, nil)
 	if err != nil {
-		// Та же чистка, что и в двух путях выше — не оставляем старое
-		// значение зависшим только потому что подвела именно эта проверка,
-		// а не Scan()/toFloat64().
 		if existing, exists := lookupQueryMetric(name); exists {
 			existing.Delete(buildLabelValues(queryCfg.DB, queryCfg.DBEnv, queryCfg.Labels, nil))
 		}

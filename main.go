@@ -18,6 +18,8 @@ import (
 func main() {
 	configPath := flag.String("config", "./config.yaml", "path to config file")
 	listenAddr := flag.String("listen-address", ":2112", "address for the metrics HTTP server to listen on")
+	watchRequired := flag.Bool("watch-required", false, "exit with a nonzero code if the config directory "+
+		"watcher (hot-reload) fails to set up, instead of continuing with a one-time config load")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -38,13 +40,15 @@ func main() {
 	})
 
 	// /readyz — хотя бы один reload применил структурно валидный конфиг.
-	// Не зависит от доступности отдельных БД: partial outage переживается
-	// штатно и не должен выталкивать здоровый Pod из Service — недоступность
-	// БД видна через свои метрики (app_db_connection_errors_total, app_query_up).
+	// Не зависит от доступности отдельных БД — недоступность видна через
+	// свои метрики (app_db_connection_errors_total, app_query_up).
+	// a.ctx.Err() проверяется отдельно от isReady() — при SIGTERM appCtx
+	// отменяется сразу, но HTTP-сервер отвечает ещё некоторое время до
+	// metricsSrv.Shutdown() в конце teardown.
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		if !a.isReady() {
+		if a.ctx.Err() != nil || !a.isReady() {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte("config not yet applied"))
+			_, _ = w.Write([]byte("shutting down or config not yet applied"))
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -98,31 +102,42 @@ func main() {
 		defer bgWG.Done()
 		watchConfig(a.ctx, a.logger, a.configPath, a.reload, a.watchDirsCh, watcherReady)
 	}()
-	if err := <-watcherReady; err != nil {
-		logger.Error("failed to set up config watcher — hot-reload will not work, "+
-			"continuing with a one-time config load", "error", err)
-	}
-
-	// poolHealthChecker стартует после первого reload — иначе его тикер
-	// создавался бы с дефолтом 5 минут из newApp(), а не реальным
-	// db_reconnect_interval из конфига.
-	a.reload()
-
-	bgWG.Add(1)
-	go func() {
-		defer bgWG.Done()
-		a.poolHealthChecker()
-	}()
 
 	exitCode := 0
 
-	select {
-	case <-appCtx.Done():
-		logger.Info("shutdown signal received")
-	case err := <-listenErrCh:
-		logger.Error("metrics server failed to listen, shutting down", "error", err)
-		appCancel()
-		exitCode = 1
+	if err := <-watcherReady; err != nil {
+		configWatcherUp.Set(0)
+		logger.Error("failed to set up config watcher — hot-reload will not work, "+
+			"continuing with a one-time config load", "error", err)
+		if *watchRequired {
+			logger.Error("--watch-required is set, shutting down without loading config", "error", err)
+			appCancel()
+			exitCode = 1
+		}
+	} else {
+		configWatcherUp.Set(1)
+	}
+
+	if exitCode == 0 {
+		// poolHealthChecker стартует после первого reload — иначе его тикер
+		// создавался бы с дефолтом 5 минут из newApp(), а не реальным
+		// db_reconnect_interval из конфига.
+		a.reload()
+
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			a.poolHealthChecker()
+		}()
+
+		select {
+		case <-appCtx.Done():
+			logger.Info("shutdown signal received")
+		case err := <-listenErrCh:
+			logger.Error("metrics server failed to listen, shutting down", "error", err)
+			appCancel()
+			exitCode = 1
+		}
 	}
 
 	bgWG.Wait()

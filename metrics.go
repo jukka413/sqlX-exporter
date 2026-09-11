@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -49,13 +48,10 @@ var (
 		[]string{"db"},
 	)
 
-	// invariantViolations — должен оставаться на нуле всегда. Все остальные
-	// метрики ошибок в этом файле отражают нормальные операционные условия
-	// (БД недоступна, запрос упал, конфликт схемы) — это другое: сигнал, что
-	// нарушился внутренний инвариант, который по конструкции кода не должен
-	// быть нарушим (например revision двух менеджеров разошлись под locked
-	// stateMu). Ненулевое значение означает баг в самом экспортёре, не
-	// проблему со средой/конфигом/БД — стоит алертить отдельно и жёстче.
+	// invariantViolations — должен оставаться на нуле всегда. В отличие от
+	// остальных метрик ошибок (БД недоступна, запрос упал — нормальные
+	// операционные условия), ненулевое значение означает баг в самом
+	// экспортёре, не проблему со средой/конфигом/БД.
 	invariantViolations = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "app_internal_invariant_violations_total",
@@ -92,14 +88,18 @@ var (
 		Help: "Unix timestamp of the last successful config reload",
 	})
 
-	// dbUp — обновляется в двух местах: сразу при (пере)подключении (см.
-	// updateDBUpMetrics) для быстрой положительной реакции, и периодически
-	// activeHealthCheck'ом через реальный PingContext — иначе значение
-	// отражало бы только факт "когда-то подключились", а не текущую
-	// доступность: тихо умершая сеть держала бы 1 бесконечно, пока
-	// какой-нибудь query не наткнётся на неё сам. Существует для каждой БД
-	// конфига всегда, в отличие от app_query_up, которой может не быть,
-	// если ни один воркер для этой БД не стартовал.
+	// configWatcherUp — 1 если fsnotify-watch на директорию конфига
+	// установлен успешно (hot-reload работает), 0 если нет — exporter
+	// тогда работает только с тем конфигом, что загрузил при старте.
+	configWatcherUp = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "app_config_watcher_up",
+		Help: "1 if the config directory watcher (hot-reload) was set up successfully, 0 if hot-reload is unavailable and the exporter is running with a one-time config load",
+	})
+
+	// dbUp — обновляется сразу при (пере)подключении (updateDBUpMetrics) и
+	// периодически активным Ping'ом (activeHealthCheck) — без последнего
+	// значение отражало бы только "когда-то подключились", не текущую
+	// доступность.
 	dbUp = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "app_db_up",
@@ -108,12 +108,10 @@ var (
 		[]string{"db"},
 	)
 
-	// dbConfigApplied — отдельный вопрос от dbUp: не "жива ли БД сейчас",
-	// а "то ли применено, что сейчас написано в конфиге". Может законно
-	// разойтись с dbUp во время graceful degradation (ротация пароля/хоста):
-	// старое соединение продолжает пинговаться (dbUp=1), но новый кандидат
-	// конфига не подключился (dbConfigApplied=0) — без отдельной метрики
-	// эту ситуацию видно только по логам, не по текущему состоянию.
+	// dbConfigApplied — отдельно от dbUp: не "жива ли БД", а "применён ли
+	// последний желаемый конфиг". Может разойтись с dbUp во время graceful
+	// degradation (ротация пароля/хоста) — старое соединение ещё пингуется
+	// (dbUp=1), но новый кандидат не подключился (dbConfigApplied=0).
 	dbConfigApplied = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "app_db_config_applied",
@@ -123,16 +121,12 @@ var (
 	)
 
 	// queryHealthSchemaConflict — 1 пока у запроса конфликт схемы лейблов,
-	// из двух источников: config-level (см. workerManager.reconcile —
-	// labels:/value_column: изменились, известно заранее) и runtime
-	// (см. worker.go runOnce — колонки SQL-результата не совпали с уже
-	// зарегистрированной метрикой, известно только после выполнения).
-	// Отсутствие серии, а не 0 — так проще заметить на дашборде, не читая
-	// логи построчно. Ключ {query,db}, не только {query} — при
-	// клонировании на несколько БД клоны одного источника могут разойтись
-	// состоянием после рестарта (одному пул заменили, другому нет), и
-	// общий ключ на всех позволил бы одному клону стереть сигнал,
-	// актуальный для другого.
+	// из двух источников: config-level (известно заранее) и runtime
+	// (известно только после выполнения — см. worker.go runOnce). Отсутствие
+	// серии, а не 0 — заметнее на дашборде. Ключ {query,db}, не только
+	// {query} — клоны одного источника на несколько БД могут разойтись
+	// состоянием после рестарта, общий ключ позволил бы одному стереть
+	// сигнал другого.
 	queryHealthSchemaConflict = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "app_query_schema_conflict",
@@ -186,6 +180,7 @@ func init() {
 		configReloadTotal,
 		configLastReloadTimestamp,
 		configLastSuccessTimestamp,
+		configWatcherUp,
 		dbUp,
 		dbConfigApplied,
 		queryHealthSchemaConflict,
@@ -212,14 +207,10 @@ var (
 // Лейблы: "db", "env" (всегда), customLabels (статические из labels:),
 // colLabels (динамические из имён столбцов SELECT для multi-row).
 //
-// Если под этим именем уже был зарегистрирован GaugeVec с другим набором
-// лейблов (когда-либо в этом процессе, до или после Unregister) — Register()
-// вернёт ошибку: Registry.Unregister() намеренно не чистит внутренний
-// dimHashesByName ("must be consistent throughout the lifetime of a program").
-// "Снять и пересоздать" метрику с другой схемой поэтому не работает — это
-// ограничение client_golang, не решаемая здесь проблема. Ошибка возвращается
-// как обычная ошибка запроса (query_up=0), не паника — снимается только
-// перезапуском процесса.
+// Registry.Unregister() не чистит внутренний dimHashesByName — если под
+// этим именем когда-либо был зарегистрирован GaugeVec с другим набором
+// лейблов, Register() вернёт ошибку и после Unregister тоже; это
+// ограничение client_golang, снимается только перезапуском процесса.
 func getOrCreateQueryMetric(queryName string, customLabels map[string]string, colLabels []string) (*prometheus.GaugeVec, error) {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
@@ -238,17 +229,15 @@ func getOrCreateQueryMetric(queryName string, customLabels map[string]string, co
 		labelNames,
 	)
 
+	// Ownership строго через queryResultMetrics, не через факт наличия в
+	// Registry коллектора с равным descriptor — "усыновление" через
+	// AlreadyRegisteredError могло бы молча захватить наш же внутренний
+	// коллектор (например app_query_up при коллизии имён), после чего
+	// значения SQL-запроса писались бы прямо в наш сигнал здоровья.
 	if err := prometheus.Register(metric); err != nil {
-		are := &prometheus.AlreadyRegisteredError{}
-		if errors.As(err, are) {
-			if existing, ok := are.ExistingCollector.(*prometheus.GaugeVec); ok {
-				queryResultMetrics[queryName] = existing
-				return existing, nil
-			}
-		}
 		return nil, fmt.Errorf(
 			"metric %q: cannot register with the current label set — likely changed labels/value_column "+
-				"since first registration, or a name collision with another query; restart the process to fix: %w: %w",
+				"since first registration, or a name collision with another metric; restart the process to fix: %w: %w",
 			queryName, errSchemaMismatch, err)
 	}
 
@@ -336,15 +325,9 @@ func deleteWorkerRows(cfg QueryConfig, prevLabels *[]prometheus.Labels) {
 
 // deleteQueryHealthMetrics удаляет служебные метрики о состоянии запроса —
 // app_query_up, app_query_last_success_timestamp_seconds, app_query_errors_total,
-// app_query_duration_seconds. В отличие от бизнес-метрики (unregisterQueryMetric/
-// deleteWorkerRows), про них раньше забывали при остановке воркера — они
-// оставались замороженными на последнем значении навсегда, включая
-// app_query_up=0, что выглядело бы как вечно горящий алерт для запроса,
-// которого уже нет в конфиге.
-//
-// Ключ здесь — (metricName, db), а не сам MetricName целиком (как для
-// business-метрики) — при клонировании на несколько БД у каждого клона
-// db разное, поэтому удаление одного клона не задевает остальные.
+// app_query_duration_seconds. Ключ — (metricName, db), не сам MetricName
+// целиком: при клонировании на несколько БД у каждого клона db разное,
+// удаление одного не задевает остальные.
 func deleteQueryHealthMetrics(metricName, db string) {
 	if metricName == "" {
 		return
@@ -352,11 +335,8 @@ func deleteQueryHealthMetrics(metricName, db string) {
 	queryUp.DeleteLabelValues(metricName, db)
 	queryLastSuccess.DeleteLabelValues(metricName, db)
 	queryDuration.DeleteLabelValues(metricName, db)
-	// cancelled не входит в список — runOnce возвращается до Inc() именно
-	// для этого reason, значения counter'а с ним никогда не бывает, чистить
-	// нечего. schema_mismatch — реальный, накапливающийся reason, отсутствие
-	// его здесь раньше оставляло {query,db,reason="schema_mismatch"}
-	// навсегда после удаления запроса.
+	// cancelled не входит — Inc() для этого reason никогда не вызывается
+	// (см. runOnce), чистить нечего.
 	for _, reason := range []string{"timeout", "db_error", "schema_mismatch"} {
 		queryErrors.DeleteLabelValues(metricName, db, reason)
 	}

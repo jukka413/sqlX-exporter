@@ -84,16 +84,19 @@ envFrom: []
 #     name: sqlx-exporter-secrets   # Secret созданный ESO (см. helm/examples/externalsecret.yaml)
 
 # Отдельные переменные — для нечувствительных значений или переопределения.
+# GOGC/GOMEMLIMIT сознательно НЕ заданы в самом образе (Dockerfile) — их
+# нужно тюнить под resources.limits.memory КОНКРЕТНОГО деплоя, а образ должен
+# оставаться универсальным. Если задаёшь GOMEMLIMIT — выставляй его заметно
+# ниже resources.limits.memory (см. ниже), не вплотную: GOMEMLIMIT управляет
+# только той памятью, которую отслеживает сам рантайм Go, а не всем RSS
+# процесса — впритык к лимиту контейнера легко словить OOMKill.
 env:
-# GOGC, GOMEMLIMIT и GODEBUG уже заданы в Dockerfile.
-# Переопредели здесь если нужны другие значения для конкретного деплоя.
-# GOMEMLIMIT должен быть чуть ниже resources.limits.memory.
 # - name: GOGC
-#   value: "50"
+#   value: "50"          # чаще GC = ниже пиковая память, но больше CPU —
+#                           не задавай не измерив на своей нагрузке
 # - name: GOMEMLIMIT
-#   value: "55MiB"
-# - name: GODEBUG
-#   value: "madvdontneed=1"
+#   value: "55MiB"        # ниже resources.limits.memory (64Mi ниже в этом
+#                           же файле) — оставлен запас, не впритык
 # - name: MAIN_DB_PASSWORD
 #   valueFrom:
 #     secretKeyRef:
