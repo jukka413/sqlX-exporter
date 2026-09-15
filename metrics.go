@@ -120,17 +120,35 @@ var (
 		[]string{"db"},
 	)
 
-	// queryHealthSchemaConflict — 1 пока у запроса конфликт схемы лейблов,
-	// из двух источников: config-level (известно заранее) и runtime
-	// (известно только после выполнения — см. worker.go runOnce). Отсутствие
-	// серии, а не 0 — заметнее на дашборде. Ключ {query,db}, не только
-	// {query} — клоны одного источника на несколько БД могут разойтись
-	// состоянием после рестарта, общий ключ позволил бы одному стереть
-	// сигнал другого.
-	queryHealthSchemaConflict = prometheus.NewGaugeVec(
+	// configSchemaConflict — 1 пока у запроса config-level конфликт схемы
+	// лейблов (labels:/value_column: изменились несовместимо с уже
+	// зарегистрированной метрикой). Владеет исключительно workerManager —
+	// worker.go эту метрику не трогает вообще. Отсутствие серии, а не 0 —
+	// заметнее на дашборде. Ключ {query,db}, не только {query} — здесь и у
+	// runtimeSchemaMismatch ниже: клоны одного источника на несколько БД
+	// могут разойтись состоянием после рестарта, общий ключ позволил бы
+	// одному клону стереть сигнал другого.
+	configSchemaConflict = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "app_query_schema_conflict",
-			Help: "1 if the running query's label schema conflicts with its current config and cannot be applied without a process restart",
+			Name: "app_query_config_schema_conflict",
+			Help: "1 if the query's configured label schema conflicts with its already-registered metric and cannot be applied without a process restart",
+		},
+		[]string{"query", "db"},
+	)
+
+	// runtimeSchemaMismatch — 1 пока колонки SQL-результата не совпадают с
+	// уже зарегистрированной метрикой, обнаружено только при выполнении
+	// (см. worker.go runOnce). Владеет исключительно execution path —
+	// workerManager эту метрику не трогает. Отдельная от configSchemaConflict
+	// метрика: раньше они делили одну series, и любой успешный запуск
+	// замороженного (config-level) воркера тут же стирал сигнал, который
+	// только что выставил workerManager, хотя desired config всё ещё не
+	// применён — а любой обычный reconcile без изменений в config-level
+	// схеме мог наоборот стереть чужой, ещё не разрешённый runtime-конфликт.
+	runtimeSchemaMismatch = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "app_query_runtime_schema_mismatch",
+			Help: "1 if the query's SQL result columns don't match its already-registered metric, discovered only at execution time",
 		},
 		[]string{"query", "db"},
 	)
@@ -183,7 +201,8 @@ func init() {
 		configWatcherUp,
 		dbUp,
 		dbConfigApplied,
-		queryHealthSchemaConflict,
+		configSchemaConflict,
+		runtimeSchemaMismatch,
 		queryDuration,
 		dbPoolAcquired,
 		dbPoolIdle,

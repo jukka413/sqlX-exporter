@@ -153,13 +153,11 @@ func runOnce(
 		queryUp.WithLabelValues(metricName, queryCfg.DB).Set(0)
 		logger.Error("query failed", "query", metricName, "db", queryCfg.DB, "reason", reason, "error", runErr)
 
-		// app_query_schema_conflict — тот же гейдж, что уже используется для
-		// config-level конфликта (см. workerManager.reconcile), теперь ещё и
-		// для runtime-обнаруженного. Только для schema_mismatch — при других
-		// reason мы не добрались до проверки схемы вообще, и ничего нового
-		// про неё не знаем, поэтому гейдж не трогаем ни в какую сторону.
+		// Только для schema_mismatch — при других reason мы не добрались до
+		// проверки схемы вообще, и ничего нового про неё не знаем, поэтому
+		// гейдж не трогаем ни в какую сторону.
 		if reason == "schema_mismatch" {
-			queryHealthSchemaConflict.WithLabelValues(metricName, queryCfg.DB).Set(1)
+			runtimeSchemaMismatch.WithLabelValues(metricName, queryCfg.DB).Set(1)
 		}
 
 		if metric, exists := lookupQueryMetric(metricName); exists {
@@ -172,7 +170,7 @@ func runOnce(
 
 	queryUp.WithLabelValues(metricName, queryCfg.DB).Set(1)
 	queryLastSuccess.WithLabelValues(metricName, queryCfg.DB).SetToCurrentTime()
-	queryHealthSchemaConflict.DeleteLabelValues(metricName, queryCfg.DB)
+	runtimeSchemaMismatch.DeleteLabelValues(metricName, queryCfg.DB)
 	logger.Info("query success", "query", metricName, "db", queryCfg.DB, "duration", duration)
 
 	return nextPrevLabels

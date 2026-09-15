@@ -169,11 +169,11 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 		// прохода, и ни один реальный scrape не успел бы его увидеть.
 		if schemaChanged {
 			if w.cfg.MetricName != "" {
-				queryHealthSchemaConflict.WithLabelValues(w.cfg.MetricName, w.cfg.DB).Set(1)
+				configSchemaConflict.WithLabelValues(w.cfg.MetricName, w.cfg.DB).Set(1)
 			}
 			stats.SchemaConflicts++
 		} else if exists && w.cfg.MetricName != "" {
-			queryHealthSchemaConflict.DeleteLabelValues(w.cfg.MetricName, w.cfg.DB)
+			configSchemaConflict.DeleteLabelValues(w.cfg.MetricName, w.cfg.DB)
 		}
 
 		q.DBEnv = pEntry.cfg.Env
@@ -283,7 +283,8 @@ func (wm *workerManager) stopWorker(name string) bool {
 		deleteQueryHealthMetrics(metricName, stoppedCfg.DB)
 		// (query,db) уникален для этого воркера даже при клонировании —
 		// в отличие от бизнес-метрики, sharedByOthers тут не имеет значения.
-		queryHealthSchemaConflict.DeleteLabelValues(metricName, stoppedCfg.DB)
+		configSchemaConflict.DeleteLabelValues(metricName, stoppedCfg.DB)
+		runtimeSchemaMismatch.DeleteLabelValues(metricName, stoppedCfg.DB)
 	}
 	return true
 }
