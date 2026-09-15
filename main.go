@@ -97,10 +97,11 @@ func main() {
 	// fsnotify не воспроизводит события задним числом, и exporter молча
 	// остался бы на старой версии конфига до следующего изменения.
 	watcherReady := make(chan error, 1)
+	watcherDied := make(chan struct{}, 1)
 	bgWG.Add(1)
 	go func() {
 		defer bgWG.Done()
-		watchConfig(a.ctx, a.logger, a.configPath, a.reload, a.watchDirsCh, watcherReady)
+		watchConfig(a.ctx, a.logger, a.configPath, a.reload, a.watchDirsCh, watcherReady, watcherDied)
 	}()
 
 	exitCode := 0
@@ -130,13 +131,33 @@ func main() {
 			a.poolHealthChecker()
 		}()
 
-		select {
-		case <-appCtx.Done():
-			logger.Info("shutdown signal received")
-		case err := <-listenErrCh:
-			logger.Error("metrics server failed to listen, shutting down", "error", err)
-			appCancel()
-			exitCode = 1
+	shutdownWait:
+		for {
+			select {
+			case <-appCtx.Done():
+				logger.Info("shutdown signal received")
+				break shutdownWait
+			case err := <-listenErrCh:
+				logger.Error("metrics server failed to listen, shutting down", "error", err)
+				appCancel()
+				exitCode = 1
+				break shutdownWait
+			case <-watcherDied:
+				// Watcher завершился не через ctx.Done() (Events/Errors
+				// закрылись — fsnotify внутренне умер) — та же потеря
+				// способности, что и неудачная установка на старте, просто
+				// позже по времени. --watch-required проверяет это так же
+				// строго, как и при старте, не только один раз.
+				configWatcherUp.Set(0)
+				logger.Error("config watcher unexpectedly stopped — hot-reload is no longer available")
+				if *watchRequired {
+					logger.Error("--watch-required is set, shutting down")
+					appCancel()
+					exitCode = 1
+					break shutdownWait
+				}
+				// Не required — логируем, метрику обновили, продолжаем работать.
+			}
 		}
 	}
 

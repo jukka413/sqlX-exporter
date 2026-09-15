@@ -27,7 +27,13 @@ import (
 // — успех, иначе ошибка). Без этого сигнала между стартом watchConfig и
 // установкой watcher.Add() есть окно, в которое ConfigMap мог бы обновиться
 // незамеченным — fsnotify не воспроизводит события задним числом.
-func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func(), updateDirs <-chan []string, ready chan<- error) {
+//
+// watcherDied — одно значение, если watchConfig завершается НЕ через
+// ctx.Done() (fsnotify-вотчер внутренне умер — Events/Errors закрылись).
+// Без этого сигнала --watch-required проверял бы способность hot-reload
+// только на старте, а её последующая потеря в рантайме была бы невидима:
+// configWatcherUp остался бы равен 1 сколько угодно долго.
+func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload func(), updateDirs <-chan []string, ready chan<- error, watcherDied chan<- struct{}) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		logger.Error("failed to create watcher", "error", err)
@@ -123,6 +129,7 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 
 		case event, ok := <-watcher.Events:
 			if !ok {
+				watcherDied <- struct{}{}
 				return
 			}
 
@@ -160,6 +167,7 @@ func watchConfig(ctx context.Context, logger *slog.Logger, path string, reload f
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
+				watcherDied <- struct{}{}
 				return
 			}
 			logger.Error("watcher error", "error", err)
