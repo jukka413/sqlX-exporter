@@ -5,6 +5,18 @@ image:
   pullPolicy: IfNotPresent
   tag: "latest"  # defaults to Chart.appVersion
 
+# --log-level: debug|info|warn|error. debug логирует каждое успешное
+# выполнение запроса и его значение — полезно для разовой отладки,
+# не для постоянной эксплуатации (объём логов и потенциально
+# чувствительные значения в них, см. README).
+logLevel: info
+
+# --watch-required: если true — процесс завершается с ненулевым кодом
+# (и Kubernetes перезапускает Pod), когда hot-reload недоступен —
+# не удалось установить file watcher при старте, или он неожиданно
+# умер в рантайме. См. README, раздел Hot-reload.
+watchRequired: false
+
 imagePullSecrets: []
 
 nameOverride: ""
@@ -34,20 +46,20 @@ config:
   # "oracle.yaml": true
   # "mssql.yaml": true
 
-  databases:
-    main:
-      driver: "pgx"
-      url: "postgres://myuser:${MAIN_DB_PASSWORD}@pg-host:5432/mydb"
-      max_conns: 10
-      max_idle_conns: 2
-      max_conn_lifetime: "1h"
-      max_conn_idle_time: "30m"
-  queries:
-    example_query:
-      db: "main"
-      sql: "SELECT 1"
-      timeout: "5s"
-      interval: "30s"
+  databases: {}
+#    main:
+#      driver: "pgx"
+#      url: "postgres://myuser:${MAIN_DB_PASSWORD}@pg-host:5432/mydb"
+#      max_conns: 10
+#      max_idle_conns: 2
+#      max_conn_lifetime: "1h"
+#      max_conn_idle_time: "30m"
+  queries: {}
+#    example_query:
+#      db: "main"
+#      sql: "SELECT 1"
+#      timeout: "5s"
+#      interval: "30s"
 
 # =============================================================================
 # Инклюд файлы конфига

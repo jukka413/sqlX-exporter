@@ -35,6 +35,10 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --config=/etc/sqlx-exporter/config.yaml
+            - --log-level={{ .Values.logLevel }}
+            {{- if .Values.watchRequired }}
+            - --watch-required
+            {{- end }}
           ports:
             - name: metrics
               containerPort: 2112
