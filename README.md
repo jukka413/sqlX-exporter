@@ -732,7 +732,7 @@ process_open_fds                  # открытые файловые дескр
 
 ## Память и производительность
 
-`GOGC`/`GOMEMLIMIT` намеренно **не заданы** в самом образе (`Dockerfile`) — эти значения имеют смысл только в привязке к `resources.limits.memory` конкретного деплоя, а образ должен оставаться универсальным, не зашивать число, подходящее только для одной, конкретной конфигурации. Задаются через `env:` в Helm values ([helm/sqlx-exporter/values.yaml](helm/sqlx-exporter/values.yaml)):
+`GOGC`/`GOMEMLIMIT` намеренно **не заданы** в самом образе (`Dockerfile`) — эти значения имеют смысл только в привязке к `resources.limits.memory`  конкретного деплоя, а образ должен оставаться универсальным, не зашивать число, подходящее только для одной, конкретной конфигурации. Задаются через `env:` в Helm values ([helm/sqlx-exporter/values.yaml](helm/sqlx-exporter/values.yaml)):
 
 ```yaml
 resources:
