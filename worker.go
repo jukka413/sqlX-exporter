@@ -171,7 +171,7 @@ func runOnce(
 	queryUp.WithLabelValues(metricName, queryCfg.DB).Set(1)
 	queryLastSuccess.WithLabelValues(metricName, queryCfg.DB).SetToCurrentTime()
 	runtimeSchemaMismatch.DeleteLabelValues(metricName, queryCfg.DB)
-	logger.Info("query success", "query", metricName, "db", queryCfg.DB, "duration", duration)
+	logger.Debug("query success", "query", metricName, "db", queryCfg.DB, "duration", duration)
 
 	return nextPrevLabels
 }
@@ -244,7 +244,7 @@ func runSingleValue(
 	}
 	gauge.Set(value)
 
-	logger.Info("query value", "query", name, "db", queryCfg.DB, "value", value)
+	logger.Debug("query value", "query", name, "db", queryCfg.DB, "value", value)
 	return nil
 }
 
@@ -438,7 +438,7 @@ func runMultiRow(
 	for _, lbl := range prevLabels {
 		if _, exists := seenSeries[labelsKey(lbl)]; !exists {
 			metric.Delete(lbl)
-			logger.Info("removed stale metric row", "query", name, "db", queryCfg.DB, "labels", lbl)
+			logger.Debug("removed stale metric row", "query", name, "db", queryCfg.DB, "labels", lbl)
 		}
 	}
 

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -20,9 +22,16 @@ func main() {
 	listenAddr := flag.String("listen-address", ":2112", "address for the metrics HTTP server to listen on")
 	watchRequired := flag.Bool("watch-required", false, "exit with a nonzero code if the config directory "+
 		"watcher (hot-reload) fails to set up, instead of continuing with a one-time config load")
+	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	flag.Parse()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// Неизвестное значение — фолбэк на info с предупреждением, а не фатальная
+	// ошибка: одна опечатка в уровне логирования не должна ронять экспортёр.
+	level, levelErr := parseLogLevel(*logLevel)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	if levelErr != nil {
+		logger.Warn("unrecognized --log-level, using info", "value", *logLevel)
+	}
 
 	appCtx, appCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer appCancel()
@@ -177,4 +186,19 @@ func main() {
 
 	logger.Info("application stopped gracefully")
 	os.Exit(exitCode)
+}
+
+func parseLogLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(s) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info", "":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return slog.LevelInfo, fmt.Errorf("unknown log level %q", s)
+	}
 }
