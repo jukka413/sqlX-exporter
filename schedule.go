@@ -22,8 +22,13 @@ func validateSchedule(s *ScheduleConfig) error {
 			return err
 		}
 	}
-	if len(s.At) == 0 {
+	if len(s.At) == 0 && strings.TrimSpace(s.Expr) == "" {
 		return errors.New("schedule.at is empty")
+	}
+	if strings.TrimSpace(s.Expr) != "" {
+		if _, err := parseScheduleExpr(s.Expr); err != nil {
+			return fmt.Errorf("schedule.expr: %w", err)
+		}
 	}
 	for _, a := range s.At {
 		weekdays := splitComma(a.Weekday)
@@ -97,7 +102,7 @@ func sameSchedule(a, b *ScheduleConfig) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	if a.Timezone != b.Timezone {
+	if a.Timezone != b.Timezone || a.Expr != b.Expr {
 		return false
 	}
 	if len(a.At) != len(b.At) {

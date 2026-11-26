@@ -40,7 +40,7 @@ func startQueryWorker(
 	}
 
 	if queryCfg.Schedule != nil {
-		loc, entries, err := parseSchedule(queryCfg.Schedule)
+		next, err := buildScheduleNext(queryCfg.Schedule)
 		if err != nil {
 			logger.Error("invalid schedule, worker stopped", "query", metricName, "db", queryCfg.DB, "error", err)
 			return
@@ -49,7 +49,13 @@ func startQueryWorker(
 		logger.Info("started scheduled query worker", "query", metricName, "db", queryCfg.DB)
 
 		for {
-			nr := nextRun(time.Now(), loc, entries)
+			nr := next(time.Now())
+			if nr.IsZero() {
+				// Нет ни одного подходящего момента в ближайшие годы — на практике не должно случаться.
+				logger.Error("schedule has no upcoming runs, worker is idle", "query", metricName, "db", queryCfg.DB)
+				<-ctx.Done()
+				return
+			}
 			timer := time.NewTimer(time.Until(nr))
 			select {
 			case <-ctx.Done():

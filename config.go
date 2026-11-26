@@ -187,7 +187,10 @@ type QueryConfig struct {
 
 type ScheduleConfig struct {
 	Timezone string       `yaml:"timezone,omitempty"`
-	At       []ScheduleAt `yaml:"at"`
+	At       []ScheduleAt `yaml:"at,omitempty"`
+	// Expr — компактная запись расписания в синтаксисе Zabbix ("wd1-5h9-19m0-59/5").
+	// Можно задавать вместе с At: запрос выполняется в моменты из обоих списков.
+	Expr string `yaml:"expr,omitempty"`
 }
 
 type ScheduleAt struct {
