@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -23,6 +24,7 @@ func startQueryWorker(
 	queryCfg QueryConfig,
 	db *sql.DB,
 	prevLabels *[]prometheus.Labels,
+	startupSpread time.Duration,
 ) {
 	defer wg.Done()
 
@@ -66,13 +68,25 @@ func startQueryWorker(
 		return
 	}
 
+	offset := startupOffset(queryCfg.DB, name, interval, startupSpread)
+	logger.Info("started interval query worker", "query", metricName, "db", queryCfg.DB, "start_delay", offset)
+
+	if offset > 0 {
+		t := time.NewTimer(offset)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			logger.Info("stopping query worker", "query", metricName, "db", queryCfg.DB)
+			return
+		case <-t.C:
+		}
+	}
+
+	// Тикер — после задержки: смещение определяет фазу всех последующих тиков,
+	// поэтому запросы с одинаковым interval не бьют в пул одновременно и в штатной работе.
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	logger.Info("started interval query worker", "query", metricName, "db", queryCfg.DB)
-
-	// Первый запуск сразу, не дожидаясь тика — иначе /metrics пуст до
-	// interval секунд после каждого старта/рестарта воркера.
 	runIntervalTick(ctx, logger, name, metricName, queryCfg, db, timeout, interval, prevLabels)
 
 	for {
@@ -87,6 +101,18 @@ func startQueryWorker(
 			runIntervalTick(ctx, logger, name, metricName, queryCfg, db, timeout, interval, prevLabels)
 		}
 	}
+}
+
+// startupOffset — смещение первого запуска внутри min(interval, spread).
+// Хеш от db+query, а не random: смещение не меняется между рестартами и reload'ами.
+func startupOffset(db, name string, interval, spread time.Duration) time.Duration {
+	window := min(interval, spread)
+	if window <= 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(db + "\x00" + name))
+	return time.Duration(h.Sum64() % uint64(window))
 }
 
 // runIntervalTick выполняет один запуск interval-запроса и предупреждает,

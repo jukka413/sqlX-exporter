@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -31,6 +32,21 @@ type workerManager struct {
 	// той же revision, что и poolManager в этом же reload (см. app.revision).
 	lastQueries         map[string]QueryConfig
 	lastQueriesRevision uint64
+
+	// startupSpread — settings.startup_spread; под mu, читается при старте воркера.
+	startupSpread time.Duration
+}
+
+func (wm *workerManager) setStartupSpread(d time.Duration) {
+	wm.mu.Lock()
+	wm.startupSpread = d
+	wm.mu.Unlock()
+}
+
+func (wm *workerManager) getStartupSpread() time.Duration {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	return wm.startupSpread
 }
 
 func newWorkerManager(ctx context.Context, logger *slog.Logger) *workerManager {
@@ -39,6 +55,8 @@ func newWorkerManager(ctx context.Context, logger *slog.Logger) *workerManager {
 		logger:      logger,
 		workers:     make(map[string]*worker),
 		lastQueries: make(map[string]QueryConfig),
+
+		startupSpread: defaultStartupSpread,
 	}
 }
 
@@ -216,7 +234,7 @@ func (wm *workerManager) reconcile(revision uint64, queries map[string]QueryConf
 		wg := &sync.WaitGroup{}
 		wg.Add(1)
 		ctx, cancel := context.WithCancel(wm.ctx)
-		go startQueryWorker(ctx, wg, wm.logger, name, q, pEntry.db, prevLabels)
+		go startQueryWorker(ctx, wg, wm.logger, name, q, pEntry.db, prevLabels, wm.getStartupSpread())
 
 		newW := &worker{cancel: cancel, wg: wg, cfg: q, pool: pEntry, prevLabels: prevLabels}
 		wm.mu.Lock()

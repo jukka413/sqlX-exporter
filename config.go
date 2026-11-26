@@ -101,6 +101,23 @@ type AppSettings struct {
 	// DefaultTimezone — дефолт для schedule.timezone запросов без своего
 	// значения (applyDefaultTimezone). Если не задано нигде — UTC.
 	DefaultTimezone string `yaml:"default_timezone,omitempty"`
+
+	// StartupSpread — окно, в которое разносятся первые запуски interval-запросов
+	// (см. startupOffset). Пусто — defaultStartupSpread, "0s" — выключено.
+	StartupSpread string `yaml:"startup_spread,omitempty"`
+}
+
+const defaultStartupSpread = 30 * time.Second
+
+func (s AppSettings) StartupSpreadDuration() time.Duration {
+	if s.StartupSpread == "" {
+		return defaultStartupSpread
+	}
+	d, err := time.ParseDuration(s.StartupSpread)
+	if err != nil || d < 0 {
+		return defaultStartupSpread
+	}
+	return d
 }
 
 func (s AppSettings) DBReconnectIntervalDuration() time.Duration {
@@ -733,6 +750,15 @@ func validateDatabasesAndSettings(cfg Config) error {
 		}
 		if d <= 0 {
 			return fmt.Errorf("settings.db_reconnect_interval must be positive")
+		}
+	}
+	if cfg.Settings.StartupSpread != "" {
+		d, err := time.ParseDuration(cfg.Settings.StartupSpread)
+		if err != nil {
+			return fmt.Errorf("settings.startup_spread is invalid: %w", err)
+		}
+		if d < 0 {
+			return fmt.Errorf("settings.startup_spread must not be negative (use \"0s\" to disable)")
 		}
 	}
 	if cfg.Settings.DefaultDB != "" {

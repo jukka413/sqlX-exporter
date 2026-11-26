@@ -273,6 +273,7 @@ func (a *app) reload() {
 	a.defaultDB = newCfg.Settings.DefaultDB
 	a.configReady = true
 	a.mu.Unlock()
+	a.wm.setStartupSpread(newCfg.Settings.StartupSpreadDuration())
 
 	// reconcile ДО закрытия старых пулов — иначе воркер может тикнуть в
 	// окне между Close() и остановкой воркера и получить "database is closed".

@@ -33,6 +33,8 @@ config:
   settings:
     db_reconnect_interval: "5m"   # интервал переподключения к упавшим БД
     default_db: "main"            # БД по умолчанию для запросов без явного поля db
+    startup_spread: "30s"         # окно, в которое разносятся первые запуски interval-запросов (чтобы не бить в пул
+    # все сразу при старте). "0s" — выключено. См. README, "Разнесение первых запусков"
 
   # Инклюд файлы — map, не список! Это важно для multi-source ArgoCD:
   # при использовании нескольких values файлов (например default из одного репо
@@ -47,13 +49,13 @@ config:
   # "mssql.yaml": true
 
   databases: {}
-#    main:
-#      driver: "pgx"
-#      url: "postgres://myuser:${MAIN_DB_PASSWORD}@pg-host:5432/mydb"
-#      max_conns: 10
-#      max_idle_conns: 2
-#      max_conn_lifetime: "1h"
-#      max_conn_idle_time: "30m"
+  #    main:
+  #      driver: "pgx"
+  #      url: "postgres://myuser:${MAIN_DB_PASSWORD}@pg-host:5432/mydb"
+  #      max_conns: 10
+  #      max_idle_conns: 2
+  #      max_conn_lifetime: "1h"
+  #      max_conn_idle_time: "30m"
   queries: {}
 #    example_query:
 #      db: "main"
@@ -92,7 +94,7 @@ existingSecret: ""
 # envFrom монтирует Secret целиком как env-переменные.
 # Стандартный паттерн: ESO создаёт Secret из Vault → Pod читает через envFrom.
 envFrom: []
-  # - secretRef:
+# - secretRef:
 #     name: sqlx-exporter-secrets   # Secret созданный ESO (см. helm/examples/externalsecret.yaml)
 
 # Отдельные переменные — для нечувствительных значений или переопределения.
